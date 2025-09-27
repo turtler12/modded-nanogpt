@@ -565,13 +565,16 @@ class Hyperparameters:
     cooldown_frac = 0.45 # fraction of training spent cooling down the learning rate
     # evaluation and logging
     val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
-    save_checkpoint = False
+    # medhaven: for memory allocation issues
+    save_checkpoint = True
+    #save_checkpoint = False
 args = Hyperparameters()
 
 # torchrun sets these env variables
 rank = int(os.environ["RANK"])
 world_size = int(os.environ["WORLD_SIZE"])
-assert world_size == 8 # this code is designed for 8xH100
+# medhaven: changed for 1 gpu
+#assert world_size == 8 # this code is designed for 8xH100
 assert torch.cuda.is_available()
 device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
@@ -660,7 +663,9 @@ model: nn.Module = torch.compile(model, dynamic=False)
 warmup_steps = 10
 initial_state = dict(model=copy.deepcopy(model.state_dict()),
                      optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
-train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_bos=True)
+# medhaven: disabling BOS-alignment because we need 2 BOS markers
+train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_bos=False)
+#train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_bos=True)
 for _ in range(warmup_steps):
     inputs, targets = next(train_loader)
     model(inputs, targets, get_window_size_blocks(1)).backward()
@@ -676,7 +681,9 @@ del train_loader, initial_state
 #        Training and validation       #
 ########################################
 
-train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_bos=True)
+# medhaven: disabling BOS-alignment because we need 2 BOS markers
+train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_bos=False)
+#train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_bos=True)
 training_time_ms = 0
 # start the clock
 torch.cuda.synchronize()
