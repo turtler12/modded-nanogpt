@@ -9,6 +9,7 @@ import glob
 from dataclasses import dataclass
 from functools import lru_cache, partial # Added partial for hook registration
 from pathlib import Path
+import math
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
@@ -116,18 +117,64 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
     performance at all relative to UV^T, where USV^T = G is the SVD.
     """
     assert G.ndim >= 2 # batched Muon implementation by @scottjmaddox, and put into practice in the record by @YouJiacheng
-    a, b, c = (3.4445, -4.7750,  2.0315)
+    # medhaven: finetuned the coefficients to have a lower int((phi(x)-1)^2 dx) 
+    # run it to find a better combo
+    a, b, c = (3.4445, -4.755,  2.0315)
+    #a, b, c = (3.4445, -4.7750,  2.0315) # original coefficients
     X = G
     if G.size(-2) > G.size(-1):
         X = X.mT
-
-    # Ensure spectral norm is at most 1
+    """
+    Original Muon
+    normalize, transform, transform, transform .. transform
+    """
+    # # Ensure spectral norm is at most 1
     X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+
+    # medhaven: added early-exit if already ~orthonormal rows, to save time on later iterations
+    # ---- early-exit if already ~orthonormal rows ----
+    # We want X @ X^T ≈ I_(m), where m = X.size(-2)
+    m = X.size(-2)
+    I = torch.eye(m, device=X.device, dtype=X.dtype)
+    # batched identity: broadcast to X's batch dims
+    if X.ndim > 2:
+        I = I.expand(*X.shape[:-2], m, m)
+
+    # Frobenius residual (scale-invariant since we pre-normed)
+    resid = (X @ X.mT - I).norm(dim=(-2, -1))
+    # If batched, take max (or mean); max is stricter
+    resid_ok = resid.max() < 1e-2 # try 3e-2, 5e-3
+    if resid_ok:
+        if G.size(-2) > G.size(-1):
+            X = X.mT
+        return X
+
+
     # Perform the NS iterations
     for _ in range(steps):
         A = X @ X.mT
         B = b * A + c * A @ A # quintic computation strategy adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
         X = a * X + B @ X
+
+        # optional: cheap mid-loop exit
+        resid = (X @ X.mT - I).norm(dim=(-2, -1))
+        if resid.max() < 5e-3:    # a bit tighter threshold mid-loop
+            break
+
+    """
+    normalize, (transform, norm), (transform, norm) .. transform
+    """
+    # # Ensure spectral norm is at most 1
+    # X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+    # # Perform the NS iterations
+    # for loop_iteration in range(steps):
+    #     A = X @ X.mT
+    #     B = b * A + c * A @ A # quintic computation strategy adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
+    #     X = a * X + B @ X
+    #     # uncomment if you want: normalize, (transform, norm), (transform, norm) .. (transform, norm)
+    #     # X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+    #     if loop_iteration != steps-1:
+    #         X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
 
     if G.size(-2) > G.size(-1):
         X = X.mT
@@ -631,7 +678,7 @@ for opt in optimizers:
     for group in opt.param_groups:
         group["initial_lr"] = group["lr"]
 
-# learning rate schedule: stable then decay
+# learning rate schedule: stable (1) then decay (to 0.1)
 def get_lr(step: int):
     x = step / args.num_iterations # progress in training
     assert 0 <= x < 1
@@ -640,6 +687,20 @@ def get_lr(step: int):
     else:
         w = (1 - x) / args.cooldown_frac
         return w * 1.0 + (1 - w) * 0.1
+
+# medhaven: adding cosine LR with warm-up
+# ramps from 0 → 1.0 during first warm-up steps, cosine decay to 0.1
+def cosine_get_lr(step):
+    lr_max = 1.0
+    lr_min = 0.1           # match your current floor
+    warmup = 200
+    total = args.num_iterations
+
+    if step < warmup:
+        return lr_min + (lr_max - lr_min) * (step + 1) / warmup
+
+    x = (step - warmup) / max(1, total - warmup)  # 0..1
+    return lr_min + 0.5 * (lr_max - lr_min) * (1 + math.cos(math.pi * x))
 
 # attention window size schedule: linearly increase
 @lru_cache(1)
@@ -731,6 +792,8 @@ for step in range(train_steps + 1):
     # set optimization hyperparameters
     for opt in optimizers:
         for group in opt.param_groups:
+            # medhaven: trying out cosine based LR 
+            #group["lr"] = group["initial_lr"] * cosine_get_lr(step)
             group["lr"] = group["initial_lr"] * get_lr(step)
     for group in optimizer2.param_groups:
         frac = min(step / 300, 1) # momentum warmup for muon
