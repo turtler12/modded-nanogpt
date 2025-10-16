@@ -103,6 +103,244 @@ def setup_context(ctx: torch.autograd.function.FunctionCtx, inputs, output):
 mm_op.register_autograd(backward, setup_context=setup_context)
 
 # -----------------------------------------------------------------------------
+# PolarGrad optimizer
+
+@torch.no_grad()
+def polar_project_batch(X, iters: int = 5, eps: float = 1e-6):
+    """
+    Batched polar projection (nearest orthogonal) using scaled Newton–Schulz:
+        X_{k+1} = 0.5 * X_k * (3I - X_k^T X_k)
+    Requires ||X_0||2 <= 1 for convergence; we scale first.
+    X: [..., m, n] (m x n with m<=n or m>=n both ok — projects rows to be orthonormal if m<=n,
+       or columns if m>=n). Returns same shape as X.
+    """
+    if X.ndim < 2:
+        return X  # nothing to project
+
+    # Work in float32 for stability, then cast back
+    dtype_out = X.dtype
+    X = X.float()
+
+    m, n = X.shape[-2], X.shape[-1]
+    # Scale to make ||X||_2 <= 1 (use Frobenius as cheap proxy)
+    # Avoid div-by-0
+    s = X.norm(dim=(-2, -1), keepdim=True).clamp_min(eps)
+    X = X / s
+
+    I_m = torch.eye(m, device=X.device, dtype=X.dtype).expand(*X.shape[:-2], m, m)
+
+    for _ in range(iters):
+        XtX = X.transpose(-1, -2) @ X  # [..., n, n] if m>=n, else [..., n, n] — OK either way
+        # If m < n, X^T X is n×n, but the product below uses X @ (...), so shapes still align.
+        term = 3 * torch.eye(XtX.shape[-1], device=X.device, dtype=X.dtype).expand_as(XtX) - XtX
+        X = 0.5 * (X @ term)
+
+    return X.to(dtype_out)
+
+
+class PolarGrad(torch.optim.Optimizer):
+    """
+    PolarGrad — like Muon, but projects each 2D update onto the Stiefel manifold
+    via batched Polar (Newton–Schulz). Keeps the same distributed step structure.
+    """
+    def __init__(self, params, lr=0.02, weight_decay=0.01, momentum=0.95, custom_sizing=True, polar_iters: int = 5):
+        defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum)
+        self.polar_iters = polar_iters
+
+        # Reuse Muon grouping strategy so it shards efficiently
+        params = list(params)
+        if custom_sizing and dist.get_world_size()==8:
+            param_groups = self.generate_custom_param_groups(params)
+        else:
+            param_groups = self.generate_standard_param_groups(params)
+        super().__init__(param_groups, defaults)
+
+    # === same grouping helpers as Muon ===
+    def generate_standard_param_groups(self, params):
+        params = list(params)
+        param_groups = []
+        attn_subset = [p for p in params if getattr(p, 'label', None) == 'attn']
+        non_attn_subset = [p for p in params if getattr(p, 'label', None) != 'attn']
+        param_groups.append(dict(params=attn_subset))
+        sizes = {p.shape for p in non_attn_subset}
+        for size in sizes:
+            group_params = [p for p in non_attn_subset if p.shape == size]
+            param_groups.append(dict(params=group_params))
+        return param_groups
+
+    def generate_custom_param_groups(self, params):
+        label_ranks = {
+            'smear_gate': 1,  # 1 param
+            'attn_gate': 2,   # 10 params
+            'attn': 3,        # 10 params
+            'mlp': 4,         # 22 params
+        }
+        params = list(params)
+        params.sort(key=lambda x: label_ranks.get(getattr(x, 'label', ''), 99))
+        idx = 0
+        group_sizes = [1,10,16,16]
+        assert len(params)==sum(group_sizes), "Mismatch in expected custom sizing."
+        param_groups = []
+        for size in group_sizes:
+            group_params = params[idx:idx+size]
+            param_groups.append(dict(params=group_params))
+            idx += size
+        return param_groups
+
+    @torch.no_grad()
+    def step(self):
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        group_infos = []
+
+        # --- First pass: reduce_scatter grads into local shard per group ---
+        for group in self.param_groups:
+            params: list[Tensor] = group["params"]
+            if not params:
+                continue
+
+            num_params = len(params)
+            padded_num_params = ( (num_params + world_size - 1) // world_size * world_size )
+
+            grads_to_stack = [p.grad for p in params]
+            if padded_num_params > num_params:
+                padding_grad = torch.zeros_like(params[0].grad)
+                grads_to_stack.extend([padding_grad] * (padded_num_params - num_params))
+
+            stacked_grads = torch.stack(grads_to_stack)
+
+            chunk_size = padded_num_params // world_size
+            grad_chunk = torch.empty(
+                (chunk_size, *params[0].grad.shape),
+                dtype=stacked_grads.dtype,
+                device=stacked_grads.device,
+            )
+
+            reduce_future = dist.reduce_scatter_tensor(
+                grad_chunk, stacked_grads, op=dist.ReduceOp.AVG, async_op=True
+            ).get_future()
+
+            group_infos.append(
+                {
+                    "params": params,
+                    "grad_chunk": grad_chunk,
+                    "reduce_future": reduce_future,
+                    "chunk_size": chunk_size,
+                    "padded_num_params": padded_num_params,
+                }
+            )
+
+        all_gather_infos = []
+
+        # --- Second pass: compute Polar projection on local shard & launch all_gather ---
+        for group, info in zip(self.param_groups, group_infos):
+            info["reduce_future"].wait()
+
+            params = info["params"]
+            grad_chunk = info["grad_chunk"]
+            chunk_size = info["chunk_size"]
+            start_idx = rank * chunk_size
+
+            # Effective LR/WD once per group (same trick as Muon)
+            p_example = params[0]
+            eff_lr_val = (
+                group["lr"]
+                * max(1, p_example.size(-2) / p_example.size(-1)) ** 0.5
+                * getattr(p_example, "lr_mul", 1.0)
+            )
+            eff_weight_decay_val = (
+                group["lr"]
+                * group["weight_decay"]
+                * getattr(p_example, "wd_mul", 1.0)
+            )
+
+            updated_param_chunk = torch.empty(
+                (chunk_size, *p_example.shape),
+                dtype=p_example.dtype,
+                device=p_example.device,
+            )
+
+            # Build momentum + decay, collect updates to project
+            update_grads_for_polar = []
+            for i in range(chunk_size):
+                param_idx = start_idx + i
+                if param_idx >= len(params):
+                    updated_param_chunk[i].zero_()
+                    update_grads_for_polar.append(torch.zeros_like(p_example.grad))
+                    continue
+
+                param = params[param_idx]
+                grad = grad_chunk[i]
+                state = self.state[param]
+
+                if not state:
+                    state["momentum_buffer"] = torch.zeros_like(grad)
+
+                m_buf = state["momentum_buffer"]
+                # momentum update
+                m_buf.lerp_(grad, 1 - group["momentum"])
+                update_grad = grad.lerp(m_buf, group["momentum"])  # Polyak blend
+                update_grads_for_polar.append(update_grad)
+
+                # copy param & apply weight decay into the working buffer
+                updated_param_chunk[i].copy_(param)
+                if eff_weight_decay_val != 0:
+                    updated_param_chunk[i].mul_(1 - eff_weight_decay_val)
+
+            batched_update_grads = torch.stack(update_grads_for_polar)  # [chunk, m, n]
+
+            # If this chunk contains attn params, do the same reshape trick as Muon:
+            original_shape = batched_update_grads.shape
+            param_idx0 = start_idx if start_idx < len(params) else 0
+            is_attn = getattr(params[param_idx0], 'label', None) == 'attn'
+            if is_attn:
+                # Enforce that the whole chunk is attn (your Muon assumption)
+                for p in params[param_idx0:param_idx0+chunk_size]:
+                    assert getattr(p, 'label', None) == 'attn', "GPU cannot mix attn and mlp params within a chunk"
+                batch = 4 * original_shape[0]
+                d1 = original_shape[1]
+                d2 = original_shape[2] // 4
+                batched = batched_update_grads.view(batch, d1, d2)
+                v_chunk = polar_project_batch(batched, iters=getattr(self, "polar_iters", 5))
+                v_chunk = v_chunk.view(original_shape)
+            else:
+                v_chunk = polar_project_batch(batched_update_grads, iters=getattr(self, "polar_iters", 5))
+
+            # Apply the projected update
+            for i in range(chunk_size):
+                param_idx = start_idx + i
+                if param_idx >= len(params):
+                    continue
+                updated_param_chunk[i].add_(v_chunk[i], alpha=-eff_lr_val)
+
+            # all_gather back into full param tensor stack
+            stacked_params = torch.empty(
+                (info["padded_num_params"], *params[0].shape),
+                dtype=params[0].dtype,
+                device=params[0].device,
+            )
+            gather_future = dist.all_gather_into_tensor(
+                stacked_params, updated_param_chunk, async_op=True
+            ).get_future()
+
+            all_gather_infos.append(
+                {
+                    "gather_future": gather_future,
+                    "stacked_params": stacked_params,
+                    "orig_params": params,
+                }
+            )
+
+        # --- Final pass: write back gathered shards to actual params ---
+        for info in all_gather_infos:
+            info["gather_future"].wait()
+            stacked_params = info["stacked_params"]
+            orig_params = info["orig_params"]
+            unstacked_params = torch.unbind(stacked_params)
+            for i, p in enumerate(orig_params):
+                p.copy_(unstacked_params[i], non_blocking=True)
+
+# -----------------------------------------------------------------------------
 # Muon optimizer
 
 @torch.compile
@@ -667,16 +905,84 @@ hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim 
 embed_params = [p for n, p in model.named_parameters() if "embed" in n]
 scalar_params = [p for p in model.parameters() if p.ndim < 2]
 head_params = [model.lm_head.weight]
+# medhaven: to include smear_gate and attn_weights parameters
+gate_params = [p for n, p in model.named_parameters() if "gate" in n]
+
+
+# === Named maps / helpers for targeted projection ===
+named_2d_params = [(n, p) for n, p in model.named_parameters() if p.ndim == 2 and ("embed" not in n)]
+name_to_param = {n: p for n, p in model.named_parameters()}
+
+grad_ema: dict[str, float] = {}
+
+# === High-gradient targeted projection config ===
+USE_POLAR_HIGH_GRAD = True
+POLAR_HIGH_GRAD_WARMUP = 300   # start after 300 steps
+POLAR_HIGH_GRAD_EVERY  = 50    # project every 50 steps
+POLAR_HIGH_GRAD_TOP_PCT = 0.15 # top 15% 2D params by grad-norm EMA
+POLAR_ITERS = 3                # projection strength (3 is a good balance)
+
+def update_grad_ema(beta: float = 0.9):
+    # track grad magnitude per 2D param
+    for n, p in model.named_parameters():
+        if p.grad is None or p.ndim < 2:
+            continue
+        g = p.grad.detach()
+        val = float(g.norm())  # Frobenius
+        old = grad_ema.get(n, val)
+        grad_ema[n] = beta * old + (1 - beta) * val
+
+def select_high_grad_params(top_pct: float = POLAR_HIGH_GRAD_TOP_PCT):
+    if not grad_ema:
+        return []
+    ranked = sorted(grad_ema.items(), key=lambda kv: kv[1], reverse=True)
+    k = max(1, int(len(ranked) * top_pct))
+    top_names = {n for n, _ in ranked[:k]}
+
+    selected_params = []
+    for n in top_names:
+        # handle compiled name prefix from torch.compile
+        clean_name = n.replace("_orig_mod.", "")
+        p = name_to_param.get(n) or name_to_param.get(clean_name)
+        if p is not None and p.ndim == 2:
+            selected_params.append(p)
+    return selected_params
+
+
 
 # init the optimizer(s)
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
 optimizer1 = DistAdam(scalar_params + head_params + embed_params, lr=0.008, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0)
-optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, weight_decay=0.0)
+
+# medhaven: switching to PolarGrad
+use_polargrad = False  # flip to False to go back to Muon
+
+if use_polargrad:
+    optimizer2 = PolarGrad(
+        hidden_matrix_params + gate_params,
+        lr=0.06,
+        momentum=0.95,
+        weight_decay=0.0,
+        custom_sizing=(dist.get_world_size()==8),
+        polar_iters=5,  # can tune, 5 was 4.0 loss
+    )
+else:
+    optimizer2 = Muon(
+        hidden_matrix_params + gate_params,
+        lr=0.06,
+        momentum=0.95,
+        weight_decay=0.0,
+    )
+
+#optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, weight_decay=0.0)
 optimizers = [optimizer1, optimizer2]
 for opt in optimizers:
     for group in opt.param_groups:
         group["initial_lr"] = group["lr"]
+
+
+
 
 # learning rate schedule: stable (1) then decay (to 0.1)
 def get_lr(step: int):
@@ -701,6 +1007,8 @@ def cosine_get_lr(step):
 
     x = (step - warmup) / max(1, total - warmup)  # 0..1
     return lr_min + 0.5 * (lr_max - lr_min) * (1 + math.cos(math.pi * x))
+
+
 
 # attention window size schedule: linearly increase
 @lru_cache(1)
@@ -789,6 +1097,11 @@ for step in range(train_steps + 1):
     # --------------- TRAINING SECTION -----------------
     inputs, targets = next(train_loader)
     model(inputs, targets, get_window_size_blocks(step)).backward()
+
+    # medhaven: adding polargrad for high-gradient params
+    # update grad EMA *before* zeroing grads
+    if USE_POLAR_HIGH_GRAD:
+        update_grad_ema(beta=0.9)
     # set optimization hyperparameters
     for opt in optimizers:
         for group in opt.param_groups:
@@ -801,6 +1114,15 @@ for step in range(train_steps + 1):
     # step the optimizers
     for opt in optimizers:
         opt.step()
+    # medhaven: adding polargrad for high-gradient params
+    # === High-gradient targeted projection pass (runs on parameters) ===
+    if USE_POLAR_HIGH_GRAD and step > POLAR_HIGH_GRAD_WARMUP and (step % POLAR_HIGH_GRAD_EVERY == 0):
+        print("Using PolarGrad high-gradient targeted projection")
+        with torch.no_grad():
+            targets = select_high_grad_params(POLAR_HIGH_GRAD_TOP_PCT)
+            for p in targets:
+                p.copy_(polar_project_batch(p, iters=POLAR_ITERS))
+
     # null the gradients
     model.zero_grad(set_to_none=True)
     # logging
