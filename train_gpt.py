@@ -394,7 +394,7 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
         B = b * A + c * A @ A # quintic computation strategy adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
         X = a * X + B @ X
 
-        # optional: cheap mid-loop exit
+        # optional: mid-loop exit
         resid = (X @ X.mT - I).norm(dim=(-2, -1))
         if resid.max() < 5e-3:    # a bit tighter threshold mid-loop
             break
