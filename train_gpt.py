@@ -11,8 +11,6 @@ from functools import lru_cache, partial # Added partial for hook registration
 from pathlib import Path
 import math
 
-# testing push
-
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on some systems
