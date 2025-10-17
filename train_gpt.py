@@ -916,7 +916,7 @@ name_to_param = {n: p for n, p in model.named_parameters()}
 grad_ema: dict[str, float] = {}
 
 # === High-gradient targeted projection config ===
-USE_POLAR_HIGH_GRAD = True
+USE_POLAR_HIGH_GRAD = False
 POLAR_HIGH_GRAD_WARMUP = 300   # start after 300 steps
 POLAR_HIGH_GRAD_EVERY  = 50    # project every 50 steps
 POLAR_HIGH_GRAD_TOP_PCT = 0.15 # top 15% 2D params by grad-norm EMA
