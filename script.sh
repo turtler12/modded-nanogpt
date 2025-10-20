@@ -4,10 +4,10 @@
 #SBATCH --account=lingo
 #SBATCH --partition=lingo-h100
 #SBATCH --qos=lingo-main
-#SBATCH --time=00:25:00 # (hh:mm:ss)
+#SBATCH --time=00:40:00 # (hh:mm:ss)
 #SBATCH --output=/data/scratch/medhaven/logs/job_output_%j.log
 #SBATCH --error=/data/scratch/medhaven/logs/job_output_%j.err
-#SBATCH --gpus=4
+#SBATCH --gpus=1
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=80G
 
