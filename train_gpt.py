@@ -402,10 +402,17 @@ def polar_express(G: torch.Tensor):
         aX_plus_BX(X, B, X, beta=a, out=C)  # C = a * X + B @ X
         X, C = C, X  # Swap references to avoid unnecessary copies
 
-        # optional: mid-loop exit
-        resid = (X @ X.mT - I).norm(dim=(-2, -1))
-        if resid.max() < 5e-3:    # a bit tighter threshold mid-loop
-            break
+        m = X.size(-2)
+        I = torch.eye(m, dtype=X.dtype, device=X.device)
+        if X.ndim > 2:
+            I = I.expand(*X.shape[:-2], m, m)
+
+        
+        # optional: mid-loop exit (is this faster)
+        if not dynamo.is_compiling():
+            resid = (X @ X.mT - I).norm(dim=(-2, -1)).max().item()
+            if resid.max() < 5e-3:    # a bit tighter threshold mid-loop
+                return X
 
     """
     normalize, (transform, norm), (transform, norm) .. transform
@@ -1272,7 +1279,7 @@ class Hyperparameters:
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
     val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
-    save_checkpoint: bool = False
+    save_checkpoint: bool = True
     # attention masking
     block_size: int = 128
     ws_schedule: tuple = (3, 7, 11)
