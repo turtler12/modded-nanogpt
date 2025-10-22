@@ -1149,7 +1149,7 @@ class BOSFinder:
             cur_len = 0
             while cur_len <= num_tokens_local:
                 if idx >= n:
-                    raise StopIteration(f"Insufficient BOS ahead of position {cur}; hit tail of shard.")
+                    raise StopIteration("Insufficient BOS ahead; hit tail of shard.")
                 cur = self.bos_idx[idx]
                 starts[r].append(cur)
                 end = min(self.bos_idx[idx + 1] if idx + 1 < n else self.size,
@@ -1434,6 +1434,10 @@ model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 
 # Warmup the training kernels, then re-initialize the state so we aren't cheating
 warmup_steps = 30
+train_loader = distributed_data_generator(
+    args.train_files, args.train_batch_size, args.train_max_seq_len,
+    grad_accum_steps=grad_accum_steps
+)
 WARMUP_SNAPSHOT = dict(
     model=copy.deepcopy(model.state_dict()),
     optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]
