@@ -374,20 +374,21 @@ polar_express_coeffs = [
 ]
 
 # medhaven: try for a variety of clipping points and slopes
-# ------------- NS policy bank: (clip_at, slope) -----------------
-# slope = beta in X <- beta * X @ (gamma I - X^T X), with gamma=1
+# -------------------- NS policy sweep --------------------
+# Sweep over x_clip ∈ {no_clip, 0.05, 0.1, 0.15, ..., 0.4}
+# slope fixed near 0.8 for stability
 NS_EQNS = [
-    dict(name="clip0.10_s0.6", clip_at=0.10, slope=0.60, iters=2, renorm_every=1, resid_exit=5e-3),
-    dict(name="clip0.10_s0.8", clip_at=0.10, slope=0.80, iters=2, renorm_every=1, resid_exit=5e-3),
-    dict(name="clip0.20_s0.6", clip_at=0.20, slope=0.60, iters=2, renorm_every=1, resid_exit=5e-3),
-    dict(name="clip0.20_s0.8", clip_at=0.20, slope=0.80, iters=2, renorm_every=1, resid_exit=6e-3),
-    dict(name="clip0.30_s0.6", clip_at=0.30, slope=0.60, iters=2, renorm_every=1, resid_exit=5e-3),
-    dict(name="clip0.30_s0.8", clip_at=0.30, slope=0.80, iters=2, renorm_every=1, resid_exit=6e-3),
-    dict(name="clip0.40_s0.6", clip_at=0.40, slope=0.60, iters=2, renorm_every=1, resid_exit=5e-3),
-    dict(name="clip0.40_s0.8", clip_at=0.40, slope=0.80, iters=2, renorm_every=1, resid_exit=7e-3),
-    dict(name="clip0.50_s0.6", clip_at=0.50, slope=0.60, iters=2, renorm_every=1, resid_exit=6e-3),
-    dict(name="clip0.50_s0.8", clip_at=0.50, slope=0.80, iters=2, renorm_every=1, resid_exit=8e-3),
+    dict(name="noclip", clip_at=None, slope=0.8, iters=2, renorm_every=1, resid_exit=5e-3),
+    dict(name="clip0.05", clip_at=0.05, slope=0.8, iters=2, renorm_every=1, resid_exit=5e-3),
+    dict(name="clip0.10", clip_at=0.10, slope=0.8, iters=2, renorm_every=1, resid_exit=5e-3),
+    dict(name="clip0.15", clip_at=0.15, slope=0.8, iters=2, renorm_every=1, resid_exit=5e-3),
+    dict(name="clip0.20", clip_at=0.20, slope=0.8, iters=2, renorm_every=1, resid_exit=5e-3),
+    dict(name="clip0.25", clip_at=0.25, slope=0.8, iters=2, renorm_every=1, resid_exit=5e-3),
+    dict(name="clip0.30", clip_at=0.30, slope=0.8, iters=2, renorm_every=1, resid_exit=5e-3),
+    dict(name="clip0.35", clip_at=0.35, slope=0.8, iters=2, renorm_every=1, resid_exit=5e-3),
+    dict(name="clip0.40", clip_at=0.40, slope=0.8, iters=2, renorm_every=1, resid_exit=5e-3),
 ]
+
 # select by env var (fixed per run) or fall back to index 0
 NS_EQN_IDX = int(os.environ.get("NS_EQN_IDX", "0"))
 
@@ -439,6 +440,9 @@ def polar_express(G: torch.Tensor):
     #X = X / (X.norm(dim=(-2, -1), keepdim=True) * (1 + 2e-2) + 1e-6)
     # medhaven: scale so ||X||_2 <= clip_at  (my vertical clip) (for tweaking clip and slope)
     X = X / (X.norm(dim=(-2, -1), keepdim=True) / clip_at + 1e-6)
+    if clip_at is not None:
+        # scale spectral norm to <= clip_at
+        X = X / (X.norm(dim=(-2, -1), keepdim=True) / clip_at + 1e-6)
 
     # Allocate buffers
     X = X.contiguous()

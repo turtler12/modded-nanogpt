@@ -373,47 +373,6 @@ polar_express_coeffs = [
     (2.3465413258596377, -1.7097828382687081, 0.42323551169305323)
 ]
 
-# medhaven: try for a variety of clipping points and slopes
-# ------------- NS policy bank: (clip_at, slope) -----------------
-# slope = beta in X <- beta * X @ (gamma I - X^T X), with gamma=1
-NS_EQNS = [
-    dict(name="clip0.10_s0.6", clip_at=0.10, slope=0.60, iters=2, renorm_every=1, resid_exit=5e-3),
-    dict(name="clip0.10_s0.8", clip_at=0.10, slope=0.80, iters=2, renorm_every=1, resid_exit=5e-3),
-    dict(name="clip0.20_s0.6", clip_at=0.20, slope=0.60, iters=2, renorm_every=1, resid_exit=5e-3),
-    dict(name="clip0.20_s0.8", clip_at=0.20, slope=0.80, iters=2, renorm_every=1, resid_exit=6e-3),
-    dict(name="clip0.30_s0.6", clip_at=0.30, slope=0.60, iters=2, renorm_every=1, resid_exit=5e-3),
-    dict(name="clip0.30_s0.8", clip_at=0.30, slope=0.80, iters=2, renorm_every=1, resid_exit=6e-3),
-    dict(name="clip0.40_s0.6", clip_at=0.40, slope=0.60, iters=2, renorm_every=1, resid_exit=5e-3),
-    dict(name="clip0.40_s0.8", clip_at=0.40, slope=0.80, iters=2, renorm_every=1, resid_exit=7e-3),
-    dict(name="clip0.50_s0.6", clip_at=0.50, slope=0.60, iters=2, renorm_every=1, resid_exit=6e-3),
-    dict(name="clip0.50_s0.8", clip_at=0.50, slope=0.80, iters=2, renorm_every=1, resid_exit=8e-3),
-]
-# select by env var (fixed per run) or fall back to index 0
-NS_EQN_IDX = int(os.environ.get("NS_EQN_IDX", "0"))
-
-def _ns_step(X, beta, R_buf, In_buf):
-    """
-    One NS step: X <- beta * X @ (I_n - X^T X)
-    Shapes:
-      X: (..., m, n)
-      R_buf: (..., n, n)  (right-multiplier workspace)
-      In_buf: (..., n, n) (identity buffer for n)
-    """
-    # R_buf = X^T X  (n x n)
-    torch.matmul(X.mT, X, out=R_buf)
-    # R_buf = I_n - X^T X
-    R_buf.mul_(-1.0)
-    # add identity on the diagonal efficiently
-    # (In_buf is a prebuilt identity; we add it in-place to R_buf)
-    R_buf.add_(In_buf)
-
-    # X = beta * X @ R_buf
-    X = torch.matmul(X, R_buf)
-    X.mul_(beta)
-    return X
-
-
-
 @torch.compile(dynamic=False, fullgraph=True) # Must use dynamic=False or else it's much slower
 def polar_express(G: torch.Tensor):
     """
@@ -427,18 +386,8 @@ def polar_express(G: torch.Tensor):
     if G.size(-2) > G.size(-1):
         X = X.mT
 
-    # medhaven: selecting the NS coefficients
-    pol = NS_EQNS[NS_EQN_IDX]
-    clip_at = pol["clip_at"]
-    beta    = pol["slope"]
-    iters   = pol["iters"]
-    renorm_every = pol["renorm_every"]
-    resid_exit   = pol["resid_exit"]
-
     # Ensure spectral norm is at most 1
-    #X = X / (X.norm(dim=(-2, -1), keepdim=True) * (1 + 2e-2) + 1e-6)
-    # medhaven: scale so ||X||_2 <= clip_at  (my vertical clip) (for tweaking clip and slope)
-    X = X / (X.norm(dim=(-2, -1), keepdim=True) / clip_at + 1e-6)
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) * (1 + 2e-2) + 1e-6)
 
     # Allocate buffers
     X = X.contiguous()
@@ -446,55 +395,26 @@ def polar_express(G: torch.Tensor):
     B = torch.empty_like(A)
     C = torch.empty_like(X)
 
+    original code for polar express iterations (should be faster)
+    aX_plus_BX = torch.baddbmm if X.ndim > 2 else torch.addmm
 
-    # medhaven: pure muon for testing clipping and slopes
-    # Identity buffer for residual check
-    m, n = X.size(-2), X.size(-1)
-    
-    # Workspaces:
-    # R: (..., n, n) right-multiplier buffer for I_n - X^T X
-    R = torch.empty((*X.shape[:-2], n, n), device=X.device, dtype=X.dtype)
-    # In: identity (..., n, n)
-    In = torch.zeros_like(R)
-    In[..., range(n), range(n)] = 1
+    # Perform the iterations
+    for a, b, c in polar_express_coeffs:
+        XXT(X, out=A)  # A = X @ X.mT
+        ba_plus_cAA(A, alpha=c, beta=b, out=B)  # B = b * A + c * A @ A
+        aX_plus_BX(X, B, X, beta=a, out=C)  # C = a * X + B @ X
+        X, C = C, X  # Swap references to avoid unnecessary copies
 
-    # Identity for residual check: (..., m, m)
-    Im = torch.zeros((*X.shape[:-2], m, m), device=X.device, dtype=X.dtype)
-    Im[..., range(m), range(m)] = 1
+        m = X.size(-2)
+        I = torch.eye(m, dtype=X.dtype, device=X.device)
+        if X.ndim > 2:
+            I = I.expand(*X.shape[:-2], m, m)
 
-    # NS iterations
-    for t in range(iters):
-        X = _ns_step(X, beta, R, In)
-
-        if renorm_every and ((t + 1) % renorm_every == 0):
-            X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
-
+        # optional: mid-loop exit (is this faster)
         if not dynamo.is_compiling():
-            # residual in m x m
-            resid = (X @ X.mT - Im).norm(dim=(-2, -1)).max().item()
-            if resid < resid_exit:
-                break
-
-    # original code for polar express iterations (should be faster)
-    # aX_plus_BX = torch.baddbmm if X.ndim > 2 else torch.addmm
-
-    # # Perform the iterations
-    # for a, b, c in polar_express_coeffs:
-    #     XXT(X, out=A)  # A = X @ X.mT
-    #     ba_plus_cAA(A, alpha=c, beta=b, out=B)  # B = b * A + c * A @ A
-    #     aX_plus_BX(X, B, X, beta=a, out=C)  # C = a * X + B @ X
-    #     X, C = C, X  # Swap references to avoid unnecessary copies
-
-    #     m = X.size(-2)
-    #     I = torch.eye(m, dtype=X.dtype, device=X.device)
-    #     if X.ndim > 2:
-    #         I = I.expand(*X.shape[:-2], m, m)
-
-    #     # optional: mid-loop exit (is this faster)
-    #     if not dynamo.is_compiling():
-    #         resid = (X @ X.mT - I).norm(dim=(-2, -1)).max().item()
-    #         if resid.max() < 5e-3:    # a bit tighter threshold mid-loop
-    #             return X
+            resid = (X @ X.mT - I).norm(dim=(-2, -1)).max().item()
+            if resid.max() < 5e-3:    # a bit tighter threshold mid-loop
+                return X
 
     """
     normalize, (transform, norm), (transform, norm) .. transform
@@ -1540,67 +1460,183 @@ for opt, opt_state in zip(optimizers, initial_state["optimizers"]):
 del train_loader, initial_state
 
 ########################################
-#        Training and validation       #
+#     Training+Validation (Compare)    #
 ########################################
+import matplotlib
+matplotlib.use("Agg")  # safe on headless servers
+import matplotlib.pyplot as plt
 
-train_loader = distributed_data_generator(args.train_files, args.train_batch_size, args.train_max_seq_len, grad_accum_steps=grad_accum_steps)
-training_time_ms = 0
-# start the clock
-torch.cuda.synchronize()
-t0 = time.perf_counter()
-# begin training
-train_steps = args.num_iterations
-ws_short, ws_long = get_ws(0)
-for step in range(train_steps + 1):
-    last_step = (step == train_steps)
-    ws_short, new_ws_long = get_ws(step)
-    if new_ws_long != ws_long:
-        model.yarn.apply(ws_long, new_ws_long)
-        ws_long=new_ws_long
+def build_optimizers(mode: str, model: nn.Module):
+    """
+    mode = 'muon' -> your original split: DistAdam (scalars/embeds/head) + Muon (matrices+gates)
+    mode = 'adam' -> DistAdam on *all* trainable params (a fair distributed Adam baseline)
+    """
+    # collect params (same as above)
+    hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n and "gate" not in n]
+    embed_params = [p for n, p in model.named_parameters() if "embed" in n]
+    scalar_params = [p for p in model.parameters() if p.ndim < 2]
+    head_params = [model.lm_head.weight]
+    gate_params = [p for n, p in model.named_parameters() if "gate" in n]
 
-    # --------------- VALIDATION SECTION -----------------
-    if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+    if mode == "muon":
+        optimizer1 = DistAdam(
+            scalar_params + head_params + embed_params,
+            lr=0.008, betas=(0.65, 0.95), eps=1e-8, weight_decay=0.0,
+        )
+        optimizer2 = Muon(hidden_matrix_params + gate_params, lr=0.06, momentum=0.95, weight_decay=0.0)
+        optimizers = [optimizer1, optimizer2]
+    elif mode == "adam":
+        # Use your distributed Adam for all params; LR matches your DistAdam LR.
+        # (You can tune this, but this gives a clean apples-to-apples baseline.)
+        all_params = list(model.parameters())
+        optimizer_adam_all = DistAdam(
+            all_params, lr=0.008, betas=(0.65, 0.95), eps=1e-8, weight_decay=0.0
+        )
+        optimizers = [optimizer_adam_all]
+    else:
+        raise ValueError("mode must be 'muon' or 'adam'")
+
+    # stash initial lr
+    for opt in optimizers:
+        for group in opt.param_groups:
+            group["initial_lr"] = group["lr"]
+    return optimizers
+
+def step_optimizers_muon_style(step: int, optimizers, model):
+    """
+    Matches your existing stepping behavior:
+      - Updates LR schedule for all optimizers
+      - For 'muon' config: even steps update only Muon; odd steps update both
+      - For 'adam' config (single optimizer): step every iteration
+    """
+    # LR schedule
+    for optimizer in optimizers:
+        for group in optimizer.param_groups:
+            group["lr"] = group["initial_lr"] * get_lr(step)
+
+    if len(optimizers) == 2:
+        # set Muon momentum schedule
+        momentum = get_muon_momentum(step)
+        for group in optimizers[1].param_groups:
+            group["momentum"] = momentum
+
+        if step % 2 == 0:
+            optimizers[1].step()
+            optimizers[1].zero_grad(set_to_none=True)
+        else:
+            for opt in optimizers:
+                opt.step()
+            model.zero_grad(set_to_none=True)
+    else:
+        # pure Adam baseline
+        optimizers[0].step()
+        model.zero_grad(set_to_none=True)
+
+def run_one_mode(mode: str):
+    """
+    Runs a full schedule for the given mode, logs validation losses,
+    and returns (steps_at_eval, val_losses_tensor).
+    """
+    # reset model + yarn + optimizers to warmup snapshot
+    model.yarn.reset()
+    model.load_state_dict(initial_state["model"])
+    optimizers = build_optimizers(mode, model)
+    for opt, _ in zip(optimizers, optimizers):  # init state from saved warmup opt state but re-init fresh
+        opt_state = copy.deepcopy(opt.state_dict())
+        opt.load_state_dict(opt_state)
+
+    # data loaders (fresh so both runs see same stream)
+    train_loader = distributed_data_generator(
+        args.train_files, args.train_batch_size, args.train_max_seq_len, grad_accum_steps=grad_accum_steps
+    )
+
+    training_time_ms = 0
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+
+    ws_short, ws_long = get_ws(0)
+    steps_at_eval = []
+    val_losses = []
+
+    model.train()
+    for step in range(args.num_iterations + 1):
+        last_step = (step == args.num_iterations)
+        ws_short, new_ws_long = get_ws(step)
+        if new_ws_long != ws_long:
+            model.yarn.apply(ws_long, new_ws_long)
+            ws_long = new_ws_long
+
+        # ------ VALIDATION ------
+        if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+            eval_ws_long = args.ws_validate_post_yarn_ext if last_step else ws_long
+            torch.cuda.synchronize()
+            training_time_ms += 1000 * (time.perf_counter() - t0)
+            model.eval()
+            assert args.val_tokens % args.val_batch_size == 0
+            val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
+            val_loader = distributed_data_generator(
+                args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False
+            )
+            vloss = 0
+            with torch.no_grad():
+                for _ in range(val_steps):
+                    inputs, targets, cum_seqlens = next(val_loader)
+                    vloss += model(inputs, targets, cum_seqlens, ws_short, eval_ws_long)
+            vloss /= val_steps
+            del val_loader
+            dist.all_reduce(vloss, op=dist.ReduceOp.AVG)
+
+            steps_at_eval.append(step)
+            val_losses.append(vloss.detach().item())
+            print0(f"[{mode}] step:{step}/{args.num_iterations} val_loss:{vloss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step,1):.2f}ms", console=True)
+
+            model.train()
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+
         if last_step:
-            ws_long = args.ws_validate_post_yarn_ext
-        # stop the clock
-        torch.cuda.synchronize()
-        training_time_ms += 1000 * (time.perf_counter() - t0)
-        model.eval()
-        assert args.val_tokens % args.val_batch_size == 0
-        val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
-        val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
-        val_loss = 0
-        with torch.no_grad():
-            for _ in range(val_steps):
-                inputs, targets, cum_seqlens = next(val_loader)
-                val_loss += model(inputs, targets, cum_seqlens, ws_short, ws_long)
-        val_loss /= val_steps
-        del val_loader
-        dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
-        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
-        model.train()
-        # start the clock again
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
+            break
 
-    if last_step:
-        if master_process and args.save_checkpoint:
-            log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
-            os.makedirs(f"logs/{run_id}", exist_ok=True)
-            torch.save(log, f"logs/{run_id}/state_step{step:06d}.pt")
-        # the last step only has the validation loop, so break to avoid training
-        break
+        # ------ TRAINING ------
+        for _ in range(grad_accum_steps):
+            inputs, targets, cum_seqlens = next(train_loader)
+            model(inputs, targets, cum_seqlens, ws_short, ws_long).backward()
 
-    # --------------- TRAINING SECTION -----------------
-    for _ in range(grad_accum_steps):
-        inputs, targets, cum_seqlens = next(train_loader)
-        model(inputs, targets, cum_seqlens, ws_short, ws_long).backward()
-    step_optimizers(step, optimizers, model)
-     
-    # logging
-    approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
-    print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+        step_optimizers_muon_style(step, optimizers, model)
+
+        approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
+        print0(f"[{mode}] step:{step+1}/{args.num_iterations} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step+1):.2f}ms", console=True)
+
+    # optional checkpoint for each mode
+    if master_process and args.save_checkpoint:
+        os.makedirs(f"logs/{run_id}", exist_ok=True)
+        torch.save(
+            dict(step=args.num_iterations, mode=mode, model=model.state_dict(),
+                 optimizers=[opt.state_dict() for opt in optimizers]),
+            f"logs/{run_id}/state_{mode}_step{args.num_iterations:06d}.pt"
+        )
+
+    return steps_at_eval, val_losses
+
+# ---- Run both experiments and plot ----
+muon_steps, muon_vals = run_one_mode("muon")
+adam_steps, adam_vals = run_one_mode("adam")
+
+if master_process:
+    os.makedirs(f"logs/{run_id}", exist_ok=True)
+    fig = plt.figure(figsize=(8, 5))
+    plt.plot(muon_steps, muon_vals, marker='o', label='DistAdam + Muon')
+    plt.plot(adam_steps, adam_vals, marker='s', label='Adam (distributed, all params)')
+    plt.xlabel("Training step")
+    plt.ylabel("Validation loss")
+    plt.title("Validation Loss vs Step: Muon vs Adam")
+    plt.legend()
+    out_path = f"logs/{run_id}/loss_compare_{run_id}.png"
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=160)
+    print0(f"Saved comparison plot to {out_path}", console=True)
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
 dist.destroy_process_group()
+
