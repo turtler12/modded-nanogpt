@@ -392,6 +392,37 @@ NS_EQNS = [
 # select by env var (fixed per run) or fall back to index 0
 NS_EQN_IDX = int(os.environ.get("NS_EQN_IDX", "0"))
 
+# ---- Resolved NS params (safe for torch.compile) ----
+NS_EQN_IDX = max(0, min(NS_EQN_IDX, len(NS_EQNS) - 1))
+_POL = NS_EQNS[NS_EQN_IDX]
+
+def _get_env_float(name, default_val):
+    v = os.environ.get(name, None)
+    if v is None:
+        return default_val
+    try:
+        return float(v)
+    except Exception:
+        return default_val
+
+def _get_env_int(name, default_val):
+    v = os.environ.get(name, None)
+    if v is None:
+        return default_val
+    try:
+        return int(v)
+    except Exception:
+        return default_val
+
+# Allow env overrides; otherwise use selected sweep entry.
+# For noclip we use clip_at <= 0.0 to mean "no clipping" to avoid None in math.
+PE_CLIP_AT       = _get_env_float("NS_CLIP_AT",  (_POL["clip_at"] if _POL["clip_at"] is not None else 0.0))
+PE_BETA          = _get_env_float("NS_SLOPE",    _POL["slope"])
+PE_ITERS         = _get_env_int  ("NS_ITERS",    _POL["iters"])
+PE_RENORM_EVERY  = _get_env_int  ("NS_RENORM_EVERY", _POL["renorm_every"])
+PE_RESID_EXIT    = _get_env_float("NS_RESID_EXIT",   _POL["resid_exit"])
+
+
 def _ns_step(X, beta, R_buf, In_buf):
     """
     One NS step: X <- beta * X @ (I_n - X^T X)
@@ -414,110 +445,70 @@ def _ns_step(X, beta, R_buf, In_buf):
     return X
 
 
-
-@torch.compile(dynamic=False, fullgraph=True) # Must use dynamic=False or else it's much slower
+@torch.compile(dynamic=False, fullgraph=True)  # Must use dynamic=False or else it's much slower
 def polar_express(G: torch.Tensor):
     """
-    Polar Express Sign Method: https://arxiv.org/pdf/2505.16932
-    by Noah Amsel, David Persson, Christopher Musco, Robert M. Gower.
-    Code adapted from https://github.com/NoahAmsel/PolarExpress/tree/main by @varunneal.
+    Polar Express / NS orthogonalization with safe clipping.
+    Uses module-level constants PE_* resolved from NS_EQNS[NS_EQN_IDX] or env.
     """
     X = G.bfloat16()
 
-    # medhaven: handle tall-skinny case by transposing
+    # handle tall-skinny by transposing so we always work on (..., m, n) with m <= n
     if G.size(-2) > G.size(-1):
         X = X.mT
 
-    # medhaven: selecting the NS coefficients
-    pol = NS_EQNS[NS_EQN_IDX]
-    clip_at = pol["clip_at"]
-    beta    = pol["slope"]
-    iters   = pol["iters"]
-    renorm_every = pol["renorm_every"]
-    resid_exit   = pol["resid_exit"]
+    # Pull resolved constants (floats/ints, no dict access inside compile)
+    clip_at      = PE_CLIP_AT
+    beta         = PE_BETA
+    iters        = PE_ITERS
+    renorm_every = PE_RENORM_EVERY
+    resid_exit   = PE_RESID_EXIT
 
-    # Ensure spectral norm is at most 1
-    #X = X / (X.norm(dim=(-2, -1), keepdim=True) * (1 + 2e-2) + 1e-6)
-    # medhaven: scale so ||X||_2 <= clip_at  (my vertical clip) (for tweaking clip and slope)
-    X = X / (X.norm(dim=(-2, -1), keepdim=True) / clip_at + 1e-6)
-    if clip_at is not None:
-        # scale spectral norm to <= clip_at
-        X = X / (X.norm(dim=(-2, -1), keepdim=True) / clip_at + 1e-6)
+    # Normalize safely:
+    # - If clip_at > 0, scale spectral norm to <= clip_at
+    # - Else, use original guard to keep ||X||_2 <= ~1
+    X_norm = X.norm(dim=(-2, -1), keepdim=True)
+    if clip_at > 0.0:
+        X = X / (X_norm / clip_at + 1e-6)
+    else:
+        X = X / (X_norm * (1 + 2e-2) + 1e-6)
 
-    # Allocate buffers
+    # Workspaces
     X = X.contiguous()
-    A = torch.empty((*X.shape[:-1], X.size(-2)), device=X.device, dtype=X.dtype)
-    B = torch.empty_like(A)
-    C = torch.empty_like(X)
-
-
-    # medhaven: pure muon for testing clipping and slopes
-    # Identity buffer for residual check
     m, n = X.size(-2), X.size(-1)
-    
-    # Workspaces:
-    # R: (..., n, n) right-multiplier buffer for I_n - X^T X
+
+    # Right-multiplier buffer for (I_n - X^T X)
     R = torch.empty((*X.shape[:-2], n, n), device=X.device, dtype=X.dtype)
-    # In: identity (..., n, n)
-    In = torch.zeros_like(R)
-    In[..., range(n), range(n)] = 1
 
-    # Identity for residual check: (..., m, m)
-    Im = torch.zeros((*X.shape[:-2], m, m), device=X.device, dtype=X.dtype)
-    Im[..., range(m), range(m)] = 1
+    # Identities for residual/updates
+    In = torch.eye(n, dtype=X.dtype, device=X.device)
+    Im = torch.eye(m, dtype=X.dtype, device=X.device)
+    if X.ndim > 2:
+        In = In.expand(*X.shape[:-2], n, n)
+        Im = Im.expand(*X.shape[:-2], m, m)
 
-    # NS iterations
+    # NS iterations: X <- beta * X @ (I - X^T X)
     for t in range(iters):
-        X = _ns_step(X, beta, R, In)
+        # R = I - X^T X
+        torch.matmul(X.mT, X, out=R)
+        R.mul_(-1.0).add_(In)
 
-        if renorm_every and ((t + 1) % renorm_every == 0):
+        # X = beta * X @ R
+        X = torch.matmul(X, R)
+        X.mul_(beta)
+
+        if renorm_every > 0 and ((t + 1) % renorm_every == 0):
             X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
 
         if not dynamo.is_compiling():
-            # residual in m x m
             resid = (X @ X.mT - Im).norm(dim=(-2, -1)).max().item()
             if resid < resid_exit:
                 break
 
-    # original code for polar express iterations (should be faster)
-    # aX_plus_BX = torch.baddbmm if X.ndim > 2 else torch.addmm
-
-    # # Perform the iterations
-    # for a, b, c in polar_express_coeffs:
-    #     XXT(X, out=A)  # A = X @ X.mT
-    #     ba_plus_cAA(A, alpha=c, beta=b, out=B)  # B = b * A + c * A @ A
-    #     aX_plus_BX(X, B, X, beta=a, out=C)  # C = a * X + B @ X
-    #     X, C = C, X  # Swap references to avoid unnecessary copies
-
-    #     m = X.size(-2)
-    #     I = torch.eye(m, dtype=X.dtype, device=X.device)
-    #     if X.ndim > 2:
-    #         I = I.expand(*X.shape[:-2], m, m)
-
-    #     # optional: mid-loop exit (is this faster)
-    #     if not dynamo.is_compiling():
-    #         resid = (X @ X.mT - I).norm(dim=(-2, -1)).max().item()
-    #         if resid.max() < 5e-3:    # a bit tighter threshold mid-loop
-    #             return X
-
-    """
-    normalize, (transform, norm), (transform, norm) .. transform
-    """
-    # # Ensure spectral norm is at most 1
-    # X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
-    # # Perform the NS iterations
-    # for loop_iteration in range(steps):
-    #     A = X @ X.mT
-    #     B = b * A + c * A @ A # quintic computation strategy adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
-    #     X = a * X + B @ X
-    #     # uncomment if you want: normalize, (transform, norm), (transform, norm) .. (transform, norm)
-    #     # X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
-    #     if loop_iteration != steps-1:
-    #         X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
-
     if G.size(-2) > G.size(-1):
         X = X.mT
     return X
+
 
 # -----------------------------------------------------------------------------
 # Muon optimizer

@@ -19,4 +19,4 @@ source ~/.bashrc 2>/dev/null || true
 export NS_EQN_IDX=${SLURM_ARRAY_TASK_ID}
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-4}
 
-torchrun --standalone --nproc_per_node=1 train_gpt.py
+torchrun --standalone --nproc_per_node=1 train_gpt_with_xclips.py

@@ -395,7 +395,7 @@ def polar_express(G: torch.Tensor):
     B = torch.empty_like(A)
     C = torch.empty_like(X)
 
-    original code for polar express iterations (should be faster)
+    #original code for polar express iterations (should be faster)
     aX_plus_BX = torch.baddbmm if X.ndim > 2 else torch.addmm
 
     # Perform the iterations
@@ -413,7 +413,7 @@ def polar_express(G: torch.Tensor):
         # optional: mid-loop exit (is this faster)
         if not dynamo.is_compiling():
             resid = (X @ X.mT - I).norm(dim=(-2, -1)).max().item()
-            if resid.max() < 5e-3:    # a bit tighter threshold mid-loop
+            if resid < 5e-3:     # a bit tighter threshold mid-loop
                 return X
 
     """
@@ -1434,9 +1434,10 @@ model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 
 # Warmup the training kernels, then re-initialize the state so we aren't cheating
 warmup_steps = 30
-initial_state = dict(model=copy.deepcopy(model.state_dict()),
-                     optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
-train_loader = distributed_data_generator(args.train_files, args.train_batch_size, args.train_max_seq_len, grad_accum_steps=grad_accum_steps)
+WARMUP_SNAPSHOT = dict(
+    model=copy.deepcopy(model.state_dict()),
+    optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]
+)  # save the initial state
 for step in range(warmup_steps):
     inputs, targets, cum_seqlens = next(train_loader)
     # each window size is a new graph, need to warm up each with Yarn.attn_scale
@@ -1454,10 +1455,10 @@ for step in range(warmup_steps):
         opt.step()
     model.zero_grad(set_to_none=True)
 model.yarn.reset() # rotary buffer is not stored in state_dict
-model.load_state_dict(initial_state["model"])
-for opt, opt_state in zip(optimizers, initial_state["optimizers"]):
+model.load_state_dict(WARMUP_SNAPSHOT["model"])
+for opt, opt_state in zip(optimizers, WARMUP_SNAPSHOT["optimizers"]):
     opt.load_state_dict(opt_state)
-del train_loader, initial_state
+del train_loader
 
 ########################################
 #     Training+Validation (Compare)    #
@@ -1539,11 +1540,12 @@ def run_one_mode(mode: str):
     """
     # reset model + yarn + optimizers to warmup snapshot
     model.yarn.reset()
-    model.load_state_dict(initial_state["model"])
+    model.load_state_dict(WARMUP_SNAPSHOT["model"])
+
     optimizers = build_optimizers(mode, model)
-    for opt, _ in zip(optimizers, optimizers):  # init state from saved warmup opt state but re-init fresh
-        opt_state = copy.deepcopy(opt.state_dict())
-        opt.load_state_dict(opt_state)
+    for opt, opt_state in zip(optimizers, WARMUP_SNAPSHOT["optimizers"]):
+        opt.load_state_dict(copy.deepcopy(opt_state))
+
 
     # data loaders (fresh so both runs see same stream)
     train_loader = distributed_data_generator(
