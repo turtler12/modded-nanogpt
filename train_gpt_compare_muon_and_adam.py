@@ -1547,8 +1547,18 @@ def run_one_mode(mode: str):
     model.load_state_dict(WARMUP_SNAPSHOT["model"])
 
     optimizers = build_optimizers(mode, model)
-    for opt, opt_state in zip(optimizers, WARMUP_SNAPSHOT["optimizers"]):
-        opt.load_state_dict(copy.deepcopy(opt_state))
+    if mode == "muon":
+        # snapshot was captured from the muon config (2 opts) with matching grouping
+        snap_opts = WARMUP_SNAPSHOT["optimizers"]
+        for opt, opt_state in zip(optimizers, snap_opts):
+            # extra safety: only load if param-group counts match
+            if len(opt.param_groups) == len(opt_state["param_groups"]):
+                opt.load_state_dict(copy.deepcopy(opt_state))
+            else:
+                print0("[muon] Skipping opt state load: param_group mismatch", console=True)
+    else:  # "adam" baseline -> fresh optimizer state
+        for opt in optimizers:
+            opt.zero_grad(set_to_none=True)
 
 
     # data loaders (fresh so both runs see same stream)
