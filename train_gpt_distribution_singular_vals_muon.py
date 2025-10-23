@@ -1,3 +1,11 @@
+
+# medhaven: added for this
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")  # headless
+import matplotlib.pyplot as plt
+
+
 import os
 import sys
 
@@ -1055,6 +1063,130 @@ class GPT(nn.Module):
         )
         return loss
 
+
+# medhaven: added for SVD decomposition to analyze W_v matrices at the beginning, mid training, and end of training
+
+@torch.inference_mode()
+def _get_Wv_matrices(model: nn.Module) -> list[torch.Tensor]:
+    """
+    Returns a list of W_v matrices (one per transformer block with attention).
+    Each W_v is shaped [hdim, dim] (e.g., 768 x 768). Returned on CPU float32.
+    """
+    Wvs = []
+    for blk in model.blocks:
+        if getattr(blk, "attn", None) is None:
+            continue
+        # qkvo_w is [hdim, dim*4], we view as [4, hdim, dim]
+        qkvo = blk.attn.qkvo_w.detach()
+        hdim = blk.attn.hdim
+        dim  = blk.attn.dim
+        qkvo_4 = qkvo.view(4, hdim, dim)
+        Wv = qkvo_4[2]  # index 2 is V
+        Wvs.append(Wv.to(dtype=torch.float32, device="cpu"))
+    return Wvs
+
+@torch.inference_mode()
+def compute_Wv_singular_values(model: nn.Module) -> dict[int, np.ndarray]:
+    """
+    For each block index -> np.array of singular values for that block's W_v.
+    """
+    svals_by_layer: dict[int, np.ndarray] = {}
+    layer_idx = 0
+    for blk in model.blocks:
+        if getattr(blk, "attn", None) is None:
+            continue
+        # extract W_v on CPU float32
+        hdim = blk.attn.hdim
+        dim  = blk.attn.dim
+        Wv = blk.attn.qkvo_w.detach().view(4, hdim, dim)[2].to(dtype=torch.float32, device="cpu")
+        # SVD on CPU to avoid interfering with training kernels
+        svals = torch.linalg.svdvals(Wv).numpy()
+        svals_by_layer[layer_idx] = svals
+        layer_idx += 1
+    return svals_by_layer
+
+def _sv_stats(s: np.ndarray) -> dict[str, float]:
+    return dict(
+        count=int(s.size),
+        mean=float(np.mean(s)),
+        std=float(np.std(s)),
+        min=float(np.min(s)),
+        q25=float(np.quantile(s, 0.25)),
+        median=float(np.median(s)),
+        q75=float(np.quantile(s, 0.75)),
+        max=float(np.max(s)),
+    )
+
+def _save_svals_npz(svals_by_layer: dict[int, np.ndarray], outpath: str):
+    # Save as npz with keys layer_0, layer_1, ...
+    np.savez(outpath, **{f"layer_{k}": v for k, v in svals_by_layer.items()})
+
+def _flatten_all(svals_by_layer: dict[int, np.ndarray]) -> np.ndarray:
+    return np.concatenate([v for v in svals_by_layer.values()], axis=0)
+
+def _log_sval_summary(tag: str, svals_by_layer: dict[int, np.ndarray], print0=print):
+    all_s = _flatten_all(svals_by_layer)
+    stats = _sv_stats(all_s)
+    print0(f"[SVD/{tag}] all-layers singular values summary: "
+           f"count={stats['count']} mean={stats['mean']:.4f} std={stats['std']:.4f} "
+           f"min={stats['min']:.4f} q25={stats['q25']:.4f} median={stats['median']:.4f} "
+           f"q75={stats['q75']:.4f} max={stats['max']:.4f}", console=True)
+
+def _plot_hist_all(tag: str, svals_by_layer: dict[int, np.ndarray], out_png: str):
+    all_s = _flatten_all(svals_by_layer)
+    plt.figure(figsize=(7,4.5))
+    plt.hist(all_s, bins=80)
+    plt.title(f"W_v singular values – {tag} (all layers)")
+    plt.xlabel("σ")
+    plt.ylabel("count")
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=160)
+    plt.close()
+
+def _plot_box_per_layer(tag: str, svals_by_layer: dict[int, np.ndarray], out_png: str):
+    # order by layer index
+    layers = sorted(svals_by_layer.keys())
+    data = [svals_by_layer[i] for i in layers]
+    plt.figure(figsize=(10,4.5))
+    plt.boxplot(data, showfliers=False)
+    plt.title(f"W_v singular values – per layer – {tag}")
+    plt.xlabel("layer index (with attention)")
+    plt.ylabel("σ")
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=160)
+    plt.close()
+
+def _plot_ecdf(tag: str, svals_by_layer: dict[int, np.ndarray], out_png: str):
+    # ECDF of all values
+    all_s = np.sort(_flatten_all(svals_by_layer))
+    y = np.arange(1, all_s.size+1) / all_s.size
+    plt.figure(figsize=(7,4.5))
+    plt.plot(all_s, y, drawstyle="steps-post")
+    plt.title(f"W_v singular values ECDF – {tag}")
+    plt.xlabel("σ")
+    plt.ylabel("F(σ)")
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=160)
+    plt.close()
+
+def dump_and_plot_wv_svals(model: nn.Module, run_id: str, tag: str, print0=print):
+    """
+    Compute, log, and plot distributions for W_v singular values.
+    tag: 'init', 'mid', 'final'
+    """
+    out_dir = f"logs/{run_id}/wv_svals"
+    os.makedirs(out_dir, exist_ok=True)
+    svals = compute_Wv_singular_values(model)
+    # save raw
+    _save_svals_npz(svals, os.path.join(out_dir, f"wv_svals_{tag}.npz"))
+    # log summary
+    _log_sval_summary(tag, svals, print0=print0)
+    # plots
+    _plot_hist_all(tag, svals, os.path.join(out_dir, f"wv_hist_{tag}.png"))
+    _plot_box_per_layer(tag, svals, os.path.join(out_dir, f"wv_box_{tag}.png"))
+    _plot_ecdf(tag, svals, os.path.join(out_dir, f"wv_ecdf_{tag}.png"))
+
+
 # -----------------------------------------------------------------------------
 # Distributed data loader
 
@@ -1318,6 +1450,11 @@ for m in model.modules():
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
+# medhaven: singular values @ init (before any warmup)
+if master_process:
+    dump_and_plot_wv_svals(model, args.run_id, tag="init", print0=print0)
+
+
 # collect the parameters to optimize
 hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n and "gate" not in n]
 embed_params = [p for n, p in model.named_parameters() if "embed" in n]
@@ -1468,6 +1605,11 @@ for step in range(train_steps + 1):
         del val_loader
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+
+        # medhaven: singular values @ final checkpoint
+        if last_step and master_process:
+            dump_and_plot_wv_svals(model, args.run_id, tag="final", print0=print0)
+
         model.train()
         # start the clock again
         torch.cuda.synchronize()
@@ -1478,6 +1620,7 @@ for step in range(train_steps + 1):
             log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
             os.makedirs(f"logs/{run_id}", exist_ok=True)
             torch.save(log, f"logs/{run_id}/state_step{step:06d}.pt")
+
         # the last step only has the validation loop, so break to avoid training
         break
 
@@ -1490,6 +1633,11 @@ for step in range(train_steps + 1):
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+
+    # medhaven: singular values @ middle checkpoint
+    if master_process and (step + 1) == (train_steps // 2):
+        dump_and_plot_wv_svals(model, args.run_id, tag="mid", print0=print0)
+
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)

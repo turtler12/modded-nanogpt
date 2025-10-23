@@ -1,3 +1,11 @@
+
+# medhaven: added for this
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")  # headless
+import matplotlib.pyplot as plt
+
+
 import os
 import sys
 
@@ -405,275 +413,6 @@ def polar_express(G: torch.Tensor):
         X = X.mT
     return X
 
-# -----------------------------------------------------------------------------
-# Muon optimizer
-
-class Muon(torch.optim.Optimizer):
-    """
-    Muon - MomentUm Orthogonalized by Newton-schulz
-
-    https://kellerjordan.github.io/posts/muon/
-
-    Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-
-    processing step, in which each 2D parameter's update is replaced with the nearest orthogonal
-    matrix. To efficiently orthogonalize each update, we use a Newton-Schulz iteration, which has
-    the advantage that it can be stably run in bfloat16 on the GPU. 
-    Note: A later PR replaced Newton-Shulz with Polar Express for the orthogonalization step
-
-    Warning: This optimizer should not be used for the embedding layer, the final fully connected layer,
-    or any {0,1}-D parameters; those should all be optimized by a standard method (e.g., AdamW).
-    Though empirically small 1D params perform efficiently here:
-        NS approximately performs a magnitude normalization of the grad
-        This hyper-optimized class has faster execution time than the current impl of Adam for small params
-
-    Custom distributed sizing:
-    The model stores all attn and mlp weights in the same shape, and then updates the view as 
-    needed on the forward pass. This enables attn and mlp weights to be contained within the same 
-    dist.reduce_scatter_tensor() call. The model architecture has been customized to enable 
-    (n_attn_layers+n_mlp_layers*2)%8==0 for batching across 8 GPUs with zero padding on mlp and attn. 
-    The scheduling is:
-        1. reduce scatter smear_gate (1 param 7 padding params)
-        2. reduce scatter attn_gate (10 params 6 padding params)
-        3. reduce scatter attn/mlp round 1 (10 attn params 6 mlp params)
-        4. reduce scatter attn/mlp round 2 (16 mlp params)
-        5. wait on step 1, then compute update of 1 and schedule all gather
-        6. wait on step 2, then compute update of 2 and schedule all gather
-        7. wait on step 3, then compute update of 3 and schedule all gather
-            GPUs receive [2 ATTN, 2 ATTN, 2 ATTN, 2 ATTN, 2 ATTN, 2 MLP, 2 MLP, 2 MLP]
-            GPUs that receive params of type attn reshape before computing update
-        8. wait on 4, then compute update of 4 and schedule all gather
-        9. wait for each all gather to complete and update params
-    Empirically, leading with small params provides an additional 0.2s improvement.
-    """
-    def __init__(self, params, lr=0.02, weight_decay=0.01, momentum=0.95, custom_sizing=True):
-        defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum)
-        # custom sizing requires 8 GPUs
-        if custom_sizing and dist.get_world_size()==8:
-            param_groups = self.generate_custom_param_groups(params)
-        else:
-            param_groups = self.generate_standard_param_groups(params)
-        super().__init__(param_groups, defaults)
-
-    def generate_standard_param_groups(self, params):
-        """
-        Use this method if running on less than 8 GPU or experimenting with additional attn or mlp modules.
-        Creates one param group per size, while giving attn its own param group for resize op.
-        """
-        params = list(params)
-        param_groups = []
-        attn_subset = [p for p in params if p.label == 'attn']
-        non_attn_subset = [p for p in params if p.label != 'attn']
-        param_groups.append(dict(params=attn_subset))
-
-        sizes = {p.shape for p in non_attn_subset}
-        for size in sizes:
-            group_params = [p for p in non_attn_subset if p.shape == size]
-            param_groups.append(dict(params=group_params))
-        return param_groups
-    
-    def generate_custom_param_groups(self, params):
-        """
-        Implementation requires that a single GPU does not receive both attn 
-        and mlp params when a param group is split across GPUs.
-        """
-        label_ranks = {
-            'smear_gate': 1, # 1 param
-            'attn_gate': 2, # 10 params
-            'attn': 3, # 10 params
-            'mlp': 4, # 22 params
-        }
-        params = list(params)
-        params.sort(key=lambda x: label_ranks.get(x.label))
-        idx = 0
-        group_sizes = [1,10,16,16]
-        assert len(params)==sum(group_sizes)
-        param_groups = []
-        for size in group_sizes:
-            group_params = params[idx:idx+size]
-            param_groups.append(dict(params=group_params))
-            idx += size
-        return param_groups
-
-    @torch.no_grad()
-    def step(self):
-        # Efficient systems-wise implementation of step developed by @YouJiacheng,
-        # @KonstantinWilleke, @alexrgilbert, @adricarda, @tuttyfrutyee, @vdlad,
-        # @ryanyang0, and @vagrawal.
-        rank = dist.get_rank()
-        world_size = dist.get_world_size()
-        group_infos = []
-        for group in self.param_groups:
-            params: list[Tensor] = group["params"]
-            if not params:
-                continue
-
-            num_params = len(params)
-            padded_num_params = (
-                (num_params + world_size - 1) // world_size * world_size
-            )
-
-            grads_to_stack = [p.grad for p in params]
-            if padded_num_params > num_params:
-                padding_grad = torch.zeros_like(params[0].grad)
-                grads_to_stack.extend(
-                    [padding_grad] * (padded_num_params - num_params)
-                )
-
-            stacked_grads = torch.stack(grads_to_stack)
-
-            chunk_size = padded_num_params // world_size
-            grad_chunk = torch.empty(
-                (chunk_size, *params[0].grad.shape),
-                dtype=stacked_grads.dtype,
-                device=stacked_grads.device,
-            )
-
-            reduce_future = dist.reduce_scatter_tensor(
-                grad_chunk, stacked_grads, op=dist.ReduceOp.AVG, async_op=True
-            ).get_future()
-
-            group_infos.append(
-                {
-                    "params": params,
-                    "grad_chunk": grad_chunk,
-                    "reduce_future": reduce_future,
-                    "chunk_size": chunk_size,
-                    "padded_num_params": padded_num_params,
-                }
-            )
-
-        all_gather_infos = []
-        # Second pass: wait for gradients, compute updates for the local shard of parameters,
-        # and launch all async all_gather operations.
-        for group, info in zip(self.param_groups, group_infos):
-            info["reduce_future"].wait()
-
-            params = info["params"]
-            grad_chunk = info["grad_chunk"]
-            chunk_size = info["chunk_size"]
-            start_idx = rank * chunk_size
-
-            # Determine effective LR and WD once per group, assuming constant for same-shaped params.
-            # This helps in vectorizing operations later.
-            p_example = params[0]  # All params in a group have the same shape.
-            eff_lr_val = (
-                group["lr"]
-                * max(1, p_example.size(-2) / p_example.size(-1)) ** 0.5
-                * getattr(p_example, "lr_mul", 1.0)
-            )
-            eff_weight_decay_val = (
-                group["lr"]
-                * group["weight_decay"]
-                * getattr(p_example, "wd_mul", 1.0)
-            )
-
-            # Prepare a contiguous buffer for the updated parameters for this rank's chunk.
-            # This buffer will serve as the input_tensor for dist.all_gather_into_tensor.
-            updated_param_chunk = torch.empty(
-                (chunk_size, *p_example.shape),
-                dtype=p_example.dtype,
-                device=p_example.device,
-            )
-
-            # List to collect update_grad tensors for batched zeropower computation.
-            update_grads_for_zeropower = []
-
-            # Process each parameter in this rank's chunk.
-            for i in range(chunk_size):
-                param_idx = start_idx + i
-
-                if param_idx >= len(params):
-                    # For padding: Fill the corresponding part of the updated_param_chunk with zeros.
-                    # These padded entries will not be used by other ranks in the all_gather, but
-                    # initializing them prevents uninitialized memory access issues.
-                    updated_param_chunk[i].zero_()
-                    # Also append a zero tensor for zeropower input if it must be padded.
-                    update_grads_for_zeropower.append(
-                        torch.zeros_like(p_example.grad)
-                    )
-                    continue
-                param = params[param_idx]
-                grad = grad_chunk[
-                    i
-                ]  # This gradient corresponds to the current parameter param.
-                state = self.state[param]
-
-                # Initialize momentum buffer if not present
-                if not state:
-                    state["momentum_buffer"] = torch.zeros_like(grad)
-
-                momentum_buffer = state["momentum_buffer"]
-
-                # Apply momentum update directly to the persistent momentum buffer in-place.
-                momentum_buffer.lerp_(grad, 1 - group["momentum"])
-
-                # Compute the actual `update_grad` for zeropower. This creates a new tensor.
-                update_grad = grad.lerp(momentum_buffer, group["momentum"])
-                update_grads_for_zeropower.append(update_grad)
-
-                # Copy the current parameter value into the temporary buffer.
-                updated_param_chunk[i].copy_(param)
-
-                # Apply weight decay directly to the buffer.
-                updated_param_chunk[i].mul_(1 - eff_weight_decay_val)
-
-            # Stack the individual `update_grad` tensors for efficient batched zeropower computation.
-            batched_update_grads = torch.stack(update_grads_for_zeropower)
-
-            # Compute zeropower for the entire chunk in a single, batched call.
-            original_shape = batched_update_grads.shape
-            # Reshape attn params from [hdim, dim*4] to [4,hdim,dim] to apply polar_express independently to Q,K,V,O
-            param_idx = start_idx if start_idx < len(params) else 0
-            if getattr(params[param_idx], 'label', None) == 'attn':
-                for p in params[param_idx:param_idx+chunk_size]:
-                    assert getattr(params[param_idx], 'label', None)=='attn', "GPU cannot mix attn and mlp params"
-                batch = 4 * original_shape[0]
-                d1 = original_shape[1] 
-                d2 = original_shape[2] // 4
-                batched = batched_update_grads.view(batch, d1, d2)
-                v_chunk = polar_express(batched)
-                v_chunk = v_chunk.view(original_shape)
-            else:
-                v_chunk = polar_express(batched_update_grads)
-
-            # Add the computed zeropower update to the parameters in the buffer.
-            # This loop applies the zeropower output (v_chunk) to the `updated_param_chunk` buffer.
-            for i in range(chunk_size):
-                param_idx = start_idx + i
-                if param_idx >= len(params):  # Skip padded entries again.
-                    continue
-
-                # Add the computed zeropower update to the parameter in the buffer.
-                updated_param_chunk[i].add_(v_chunk[i], alpha=-eff_lr_val)
-
-            stacked_params = torch.empty(
-                (info["padded_num_params"], *params[0].shape),
-                dtype=params[0].dtype,
-                device=params[0].device,
-            )
-            gather_future = dist.all_gather_into_tensor(
-                stacked_params, updated_param_chunk, async_op=True
-            ).get_future()
-
-            all_gather_infos.append(
-                {
-                    "gather_future": gather_future,
-                    "stacked_params": stacked_params,
-                    "orig_params": params,
-                }
-            )
-
-        # Final pass: wait for all_gather to complete and copy results back into original parameter tensors.
-        for info in all_gather_infos:
-            info["gather_future"].wait()
-            stacked_params = info["stacked_params"]
-            orig_params = info["orig_params"]
-
-            unstacked_params = torch.unbind(stacked_params)
-            for i, p in enumerate(orig_params):
-                p.copy_(unstacked_params[i], non_blocking=True)
-
-
 class DistAdam(torch.optim.Optimizer):
     def __init__(self, params, lr: float = 1e-3, betas: tuple[float, float] = (0.9, 0.999), eps: float = 1e-8, weight_decay: float = 0.01):
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
@@ -1055,6 +794,130 @@ class GPT(nn.Module):
         )
         return loss
 
+
+# medhaven: added for SVD decomposition to analyze W_v matrices at the beginning, mid training, and end of training
+
+@torch.inference_mode()
+def _get_Wv_matrices(model: nn.Module) -> list[torch.Tensor]:
+    """
+    Returns a list of W_v matrices (one per transformer block with attention).
+    Each W_v is shaped [hdim, dim] (e.g., 768 x 768). Returned on CPU float32.
+    """
+    Wvs = []
+    for blk in model.blocks:
+        if getattr(blk, "attn", None) is None:
+            continue
+        # qkvo_w is [hdim, dim*4], we view as [4, hdim, dim]
+        qkvo = blk.attn.qkvo_w.detach()
+        hdim = blk.attn.hdim
+        dim  = blk.attn.dim
+        qkvo_4 = qkvo.view(4, hdim, dim)
+        Wv = qkvo_4[2]  # index 2 is V
+        Wvs.append(Wv.to(dtype=torch.float32, device="cpu"))
+    return Wvs
+
+@torch.inference_mode()
+def compute_Wv_singular_values(model: nn.Module) -> dict[int, np.ndarray]:
+    """
+    For each block index -> np.array of singular values for that block's W_v.
+    """
+    svals_by_layer: dict[int, np.ndarray] = {}
+    layer_idx = 0
+    for blk in model.blocks:
+        if getattr(blk, "attn", None) is None:
+            continue
+        # extract W_v on CPU float32
+        hdim = blk.attn.hdim
+        dim  = blk.attn.dim
+        Wv = blk.attn.qkvo_w.detach().view(4, hdim, dim)[2].to(dtype=torch.float32, device="cpu")
+        # SVD on CPU to avoid interfering with training kernels
+        svals = torch.linalg.svdvals(Wv).numpy()
+        svals_by_layer[layer_idx] = svals
+        layer_idx += 1
+    return svals_by_layer
+
+def _sv_stats(s: np.ndarray) -> dict[str, float]:
+    return dict(
+        count=int(s.size),
+        mean=float(np.mean(s)),
+        std=float(np.std(s)),
+        min=float(np.min(s)),
+        q25=float(np.quantile(s, 0.25)),
+        median=float(np.median(s)),
+        q75=float(np.quantile(s, 0.75)),
+        max=float(np.max(s)),
+    )
+
+def _save_svals_npz(svals_by_layer: dict[int, np.ndarray], outpath: str):
+    # Save as npz with keys layer_0, layer_1, ...
+    np.savez(outpath, **{f"layer_{k}": v for k, v in svals_by_layer.items()})
+
+def _flatten_all(svals_by_layer: dict[int, np.ndarray]) -> np.ndarray:
+    return np.concatenate([v for v in svals_by_layer.values()], axis=0)
+
+def _log_sval_summary(tag: str, svals_by_layer: dict[int, np.ndarray], print0=print):
+    all_s = _flatten_all(svals_by_layer)
+    stats = _sv_stats(all_s)
+    print0(f"[SVD/{tag}] all-layers singular values summary: "
+           f"count={stats['count']} mean={stats['mean']:.4f} std={stats['std']:.4f} "
+           f"min={stats['min']:.4f} q25={stats['q25']:.4f} median={stats['median']:.4f} "
+           f"q75={stats['q75']:.4f} max={stats['max']:.4f}", console=True)
+
+def _plot_hist_all(tag: str, svals_by_layer: dict[int, np.ndarray], out_png: str):
+    all_s = _flatten_all(svals_by_layer)
+    plt.figure(figsize=(7,4.5))
+    plt.hist(all_s, bins=80)
+    plt.title(f"W_v singular values – {tag} (all layers)")
+    plt.xlabel("σ")
+    plt.ylabel("count")
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=160)
+    plt.close()
+
+def _plot_box_per_layer(tag: str, svals_by_layer: dict[int, np.ndarray], out_png: str):
+    # order by layer index
+    layers = sorted(svals_by_layer.keys())
+    data = [svals_by_layer[i] for i in layers]
+    plt.figure(figsize=(10,4.5))
+    plt.boxplot(data, showfliers=False)
+    plt.title(f"W_v singular values – per layer – {tag}")
+    plt.xlabel("layer index (with attention)")
+    plt.ylabel("σ")
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=160)
+    plt.close()
+
+def _plot_ecdf(tag: str, svals_by_layer: dict[int, np.ndarray], out_png: str):
+    # ECDF of all values
+    all_s = np.sort(_flatten_all(svals_by_layer))
+    y = np.arange(1, all_s.size+1) / all_s.size
+    plt.figure(figsize=(7,4.5))
+    plt.plot(all_s, y, drawstyle="steps-post")
+    plt.title(f"W_v singular values ECDF – {tag}")
+    plt.xlabel("σ")
+    plt.ylabel("F(σ)")
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=160)
+    plt.close()
+
+def dump_and_plot_wv_svals(model: nn.Module, run_id: str, tag: str, print0=print):
+    """
+    Compute, log, and plot distributions for W_v singular values.
+    tag: 'init', 'mid', 'final'
+    """
+    out_dir = f"logs/{run_id}/wv_svals"
+    os.makedirs(out_dir, exist_ok=True)
+    svals = compute_Wv_singular_values(model)
+    # save raw
+    _save_svals_npz(svals, os.path.join(out_dir, f"wv_svals_{tag}.npz"))
+    # log summary
+    _log_sval_summary(tag, svals, print0=print0)
+    # plots
+    _plot_hist_all(tag, svals, os.path.join(out_dir, f"wv_hist_{tag}.png"))
+    _plot_box_per_layer(tag, svals, os.path.join(out_dir, f"wv_box_{tag}.png"))
+    _plot_ecdf(tag, svals, os.path.join(out_dir, f"wv_ecdf_{tag}.png"))
+
+
 # -----------------------------------------------------------------------------
 # Distributed data loader
 
@@ -1318,28 +1181,53 @@ for m in model.modules():
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
-# collect the parameters to optimize
-hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n and "gate" not in n]
-embed_params = [p for n, p in model.named_parameters() if "embed" in n]
-scalar_params = [p for p in model.parameters() if p.ndim < 2]
-head_params = [model.lm_head.weight]
-gate_params = [p for n, p in model.named_parameters() if "gate" in n]
+# medhaven: singular values @ init (before any warmup)
+if master_process:
+    dump_and_plot_wv_svals(model, args.run_id, tag="init", print0=print0)
 
-# init the optimizer(s)
-# small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
-# discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
-optimizer1 = DistAdam(
-    scalar_params + head_params + embed_params,
-    lr=0.008,
-    betas=(0.65, 0.95),
+# medhaven: commented out because this is for muon
+# collect the parameters to optimize
+# hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n and "gate" not in n]
+# embed_params = [p for n, p in model.named_parameters() if "embed" in n]
+# scalar_params = [p for p in model.parameters() if p.ndim < 2]
+# head_params = [model.lm_head.weight]
+# gate_params = [p for n, p in model.named_parameters() if "gate" in n]
+
+# # init the optimizer(s)
+# # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
+# # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
+# optimizer1 = DistAdam(
+#     scalar_params + head_params + embed_params,
+#     lr=0.008,
+#     betas=(0.65, 0.95),
+#     eps=1e-8,
+#     weight_decay=0.0,
+# )
+# optimizer2 = Muon(hidden_matrix_params + gate_params, lr=0.06, momentum=0.95, weight_decay=0.0)
+# optimizers = [optimizer1, optimizer2]
+# for opt in optimizers:
+#     for group in opt.param_groups:
+#         group["initial_lr"] = group["lr"]
+
+# medhaven: new code for Adam only
+# collect the parameters to optimize
+all_params = list(model.parameters())
+
+# ---- Adam baseline (Distributed Adam used in your compare script) ----
+# keep the same Adam hyperparams you used in your compare run
+optimizer = DistAdam(
+    all_params,
+    lr=0.008,                 # same scalar/head/embed LR you used before
+    betas=(0.65, 0.95),       # from your compare script
     eps=1e-8,
     weight_decay=0.0,
 )
-optimizer2 = Muon(hidden_matrix_params + gate_params, lr=0.06, momentum=0.95, weight_decay=0.0)
-optimizers = [optimizer1, optimizer2]
+
+optimizers = [optimizer]
 for opt in optimizers:
     for group in opt.param_groups:
         group["initial_lr"] = group["lr"]
+
 
 # learning rate schedule: stable then linear decay
 def get_lr(step: int):
@@ -1361,40 +1249,17 @@ def get_ws(step: int):
     ws_idx = int(len(args.ws_schedule) * x)
     return args.ws_schedule[ws_idx] // 2, args.ws_schedule[ws_idx]
 
-def get_muon_momentum(step: int, muon_warmup_steps=300, muon_cooldown_steps=50, momentum_min=0.85, momentum_max=0.95):
-    # warmup phase: linearly increase momentum from min to max
-    # cooldown phase: linearly decrease momentum from max to min
-    momentum_cd_start = args.num_iterations - muon_cooldown_steps
-    if step < muon_warmup_steps:
-        frac = step / muon_warmup_steps
-        momentum = momentum_min + frac * (momentum_max - momentum_min)
-    elif step > momentum_cd_start:
-        frac = (step - momentum_cd_start) / muon_cooldown_steps
-        momentum = momentum_max - frac * (momentum_max - momentum_min)
-    else:
-        momentum = momentum_max
-    return momentum
-
+# medhaven: modified to only update Adam optimizer
 def step_optimizers(step: int, optimizers, model):
-    # update lr
+    # update lr for Adam
     for optimizer in optimizers:
         for group in optimizer.param_groups:
             group["lr"] = group["initial_lr"] * get_lr(step)
 
-    # set muon momentum based on step
-    momentum = get_muon_momentum(step)
-    for group in optimizers[1].param_groups:
-        group["momentum"] = momentum
-
-    # on even steps, only step Muon params
-    # on odd steps, step all params
-    if step%2==0:
-        optimizers[1].step()
-        optimizers[1].zero_grad(set_to_none=True)
-    else:
-        for optimizer in optimizers:
-            optimizer.step()
-        model.zero_grad(set_to_none=True)
+    # single Adam step across all params
+    for optimizer in optimizers:
+        optimizer.step()
+    model.zero_grad(set_to_none=True)
 
 model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 
@@ -1468,6 +1333,11 @@ for step in range(train_steps + 1):
         del val_loader
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+
+        # medhaven: singular values @ final checkpoint
+        if last_step and master_process:
+            dump_and_plot_wv_svals(model, args.run_id, tag="final", print0=print0)
+
         model.train()
         # start the clock again
         torch.cuda.synchronize()
@@ -1478,6 +1348,7 @@ for step in range(train_steps + 1):
             log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
             os.makedirs(f"logs/{run_id}", exist_ok=True)
             torch.save(log, f"logs/{run_id}/state_step{step:06d}.pt")
+
         # the last step only has the validation loop, so break to avoid training
         break
 
@@ -1490,6 +1361,11 @@ for step in range(train_steps + 1):
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+
+    # medhaven: singular values @ middle checkpoint
+    if master_process and (step + 1) == (train_steps // 2):
+        dump_and_plot_wv_svals(model, args.run_id, tag="mid", print0=print0)
+
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
