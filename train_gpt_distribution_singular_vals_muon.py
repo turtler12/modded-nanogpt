@@ -1186,6 +1186,94 @@ def dump_and_plot_wv_svals(model: nn.Module, run_id: str, tag: str, print0=print
     _plot_box_per_layer(tag, svals, os.path.join(out_dir, f"wv_box_{tag}.png"))
     _plot_ecdf(tag, svals, os.path.join(out_dir, f"wv_ecdf_{tag}.png"))
 
+# medhaven: helpers for gradient of V singular values analysis
+
+# -------------------- Grad(V) singular values --------------------
+
+@torch.inference_mode()
+def compute_Vgrad_singular_values(
+    model: nn.Module,
+    normalize: str = "none",   # "none" | "spectral" | "polar"
+) -> dict[int, np.ndarray]:
+    """
+    For each attention block, take the grad of the V slice of qkvo_w and return its singular values.
+    - "none": raw grads
+    - "spectral": each matrix divided by its spectral norm (if >0)
+    - "polar": run Polar Express on the grad (like Muon’s orthogonalization) BEFORE SVD
+               (uses the polar_express() already defined in this file)
+    NOTE: grads must exist (call after backward and before optimizer.zero_grad()).
+    """
+    svals_by_layer: dict[int, np.ndarray] = {}
+    layer_idx = 0
+    for blk in model.blocks:
+        attn = getattr(blk, "attn", None)
+        if attn is None:
+            continue
+
+        g = attn.qkvo_w.grad
+        if g is None:
+            # layer may be skipped or hasn’t received a grad on this step
+            layer_idx += 1
+            continue
+
+        hdim = attn.hdim
+        dim  = attn.dim
+        # qkvo_w.grad shape is [hdim, dim*4]; V is index 2
+        Gv = g.detach().to(dtype=torch.float32, device="cpu").view(4, hdim, dim)[2]
+
+        if normalize == "spectral":
+            # divide by spectral norm per-matrix
+            # Gv is a single 2D matrix; SVD once for its norm, then SVD again for spectrum (cheap for 768x768)
+            sn = torch.linalg.svdvals(Gv).max().item()
+            if sn > 0:
+                Gv = (Gv / sn).contiguous()
+        elif normalize == "polar":
+            # run Polar Express on a 3D batch of size 1 (expects CUDA bf16)
+            X = Gv.to(device="cuda", dtype=torch.bfloat16)[None, ...]
+            V = polar_express(X).to(torch.float32)[0].to("cpu")
+            Gv = V.contiguous()
+
+        svals = torch.linalg.svdvals(Gv).numpy()
+        svals_by_layer[layer_idx] = svals
+        layer_idx += 1
+
+    return svals_by_layer
+
+def dump_and_plot_gradV_svals(model: nn.Module, run_id: str, tag: str, normalize: str, print0=print):
+    out_dir = f"logs/{run_id}/gradV_svals"
+    os.makedirs(out_dir, exist_ok=True)
+    svals = compute_Vgrad_singular_values(model, normalize=normalize)
+    # raw dump
+    np.savez(os.path.join(out_dir, f"gradV_svals_{normalize}_{tag}.npz"),
+             **{f"layer_{k}": v for k, v in svals.items()})
+    # summary
+    if len(svals) > 0:
+        all_s = np.concatenate([v for v in svals.values()], axis=0)
+        stats = dict(count=int(all_s.size), mean=float(all_s.mean()),
+                     std=float(all_s.std()), min=float(all_s.min()),
+                     q25=float(np.quantile(all_s,0.25)), median=float(np.median(all_s)),
+                     q75=float(np.quantile(all_s,0.75)), max=float(all_s.max()))
+        print0(f"[SVD/gradV/{normalize}/{tag}] count={stats['count']} "
+               f"mean={stats['mean']:.4f} std={stats['std']:.4f} "
+               f"min={stats['min']:.4f} q25={stats['q25']:.4f} median={stats['median']:.4f} "
+               f"q75={stats['q75']:.4f} max={stats['max']:.4f}", console=True)
+
+        # plots (reuse your plotting styles)
+        def _hist(name): 
+            plt.figure(figsize=(7,4.5)); plt.hist(all_s, bins=80)
+            plt.title(f"Grad(V) singular values – {normalize} – {tag} (all layers)")
+            plt.xlabel("σ"); plt.ylabel("count"); plt.tight_layout()
+            plt.savefig(os.path.join(out_dir, f"gradV_hist_{normalize}_{tag}.png"), dpi=160); plt.close()
+        def _box(name):
+            layers = sorted(svals.keys()); data = [svals[i] for i in layers]
+            plt.figure(figsize=(10,4.5)); plt.boxplot(data, showfliers=False)
+            plt.title(f"Grad(V) singular values – per layer – {normalize} – {tag}")
+            plt.xlabel("layer index (with attention)"); plt.ylabel("σ")
+            plt.tight_layout()
+            plt.savefig(os.path.join(out_dir, f"gradV_box_{normalize}_{tag}.png"), dpi=160); plt.close()
+        _hist(tag); _box(tag)
+
+
 
 # -----------------------------------------------------------------------------
 # Distributed data loader
@@ -1628,6 +1716,27 @@ for step in range(train_steps + 1):
     for _ in range(grad_accum_steps):
         inputs, targets, cum_seqlens = next(train_loader)
         model(inputs, targets, cum_seqlens, ws_short, ws_long).backward()
+
+        # medhaven: added for gradient of V singular values analysis
+        # --- gradient spectrum snapshot (after backward, before step) ---
+        if master_process and step == 0:
+            # three variants: raw grads, spectral-normed, and Polar-Expressed update
+            dump_and_plot_gradV_svals(model, args.run_id, tag="init", normalize="none",    print0=print0)
+            dump_and_plot_gradV_svals(model, args.run_id, tag="init", normalize="spectral", print0=print0)
+            dump_and_plot_gradV_svals(model, args.run_id, tag="init", normalize="polar",    print0=print0)
+        # mid training snapshot
+        if master_process and (step + 1) == (train_steps // 2):
+            dump_and_plot_gradV_svals(model, args.run_id, tag="mid",  normalize="none",    print0=print0)
+            dump_and_plot_gradV_svals(model, args.run_id, tag="mid",  normalize="spectral", print0=print0)
+            dump_and_plot_gradV_svals(model, args.run_id, tag="mid",  normalize="polar",    print0=print0)
+        # final training snapshot
+        if master_process and step == (train_steps - 1):
+            dump_and_plot_gradV_svals(model, args.run_id, tag="final", normalize="none",    print0=print0)
+            dump_and_plot_gradV_svals(model, args.run_id, tag="final", normalize="spectral", print0=print0)
+            dump_and_plot_gradV_svals(model, args.run_id, tag="final", normalize="polar",    print0=print0)
+
+
+
     step_optimizers(step, optimizers, model)
      
     # logging
