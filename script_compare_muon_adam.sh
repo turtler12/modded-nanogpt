@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=muon_vs_adam
+#SBATCH --job-name=muon_vs_adam_vs_sgd
 #SBATCH --account=lingo
 #SBATCH --partition=lingo-h100
 #SBATCH --qos=lingo-main

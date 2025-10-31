@@ -12,4 +12,3 @@
 
 
 torchrun --standalone --nproc_per_node=1 train_gpt_distribution_singular_vals_muon.py
-#torchrun --standalone --nproc_per_node=1 train_gpt_distribution_singular_vals_adam.py

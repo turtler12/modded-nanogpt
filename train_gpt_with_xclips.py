@@ -364,6 +364,134 @@ def ba_plus_cAA(A: torch.Tensor, alpha: float, beta: float, out: torch.Tensor):
     )
     return out
 
+# medhaven: added for xclips
+
+# =========================
+# Piecewise spectral map (SVD-free)
+# =========================
+# Implements:
+#   φ(s) = 0,                    if s <= τ
+#   φ(s) = a (s - τ),            if τ < s < s_cap  where s_cap = τ + 1/a
+#   φ(s) = 1,                    if s >= s_cap
+#
+# We need y(t) = φ(√t)/√t to apply on the right:  W @ y(WᵀW)
+# so that singular values map: s -> φ(s).
+
+CHEB_K   = int(os.environ.get("CHEB_K", "5"))     # Chebyshev order
+POW_ITERS = int(os.environ.get("POW_ITERS", "3")) # iters for λ_max
+PIECE_TAU   = float(os.environ.get("PIECE_TAU", "0.05"))  # τ
+PIECE_SLOPE = float(os.environ.get("PIECE_SLOPE", "0.9")) # a in (0,1]
+
+def _solve_cheb_coeffs(T: torch.Tensor, ys: torch.Tensor) -> torch.Tensor:
+    """
+    Solve T @ c ≈ ys for Chebyshev coefficients.
+    Returns c with shape [K] and dtype == T.dtype.
+    """
+    b = ys.unsqueeze(-1)                 # [K, 1]
+    T32 = T.to(torch.float32)
+    b32 = b.to(torch.float32)
+    try:
+        sol = torch.linalg.lstsq(T32, b32).solution  # [K,1] or [K]
+    except Exception:
+        # tiny K → pinv is perfectly fine as a fallback
+        sol = (torch.linalg.pinv(T32) @ b32)
+    return sol.flatten().to(T.dtype)     # [K]
+
+
+def _power_iteration_max_eig(G: torch.Tensor, iters: int = POW_ITERS, eps: float = 1e-12):
+    # G is PSD [n,n]
+    n = G.size(-1)
+    v = torch.randn((*G.shape[:-2], n, 1), device=G.device, dtype=G.dtype)
+    v = v / (v.norm(dim=(-2, -1), keepdim=True) + eps)
+    for _ in range(iters):
+        v = G @ v
+        v = v / (v.norm(dim=(-2, -1), keepdim=True) + eps)
+    lam = (v.mT @ (G @ v)) / (v.mT @ v + eps)
+    return lam.squeeze(-1).squeeze(-1).clamp_min(eps)
+
+def _chebyshev_apply_right(W: torch.Tensor, y_fn, K: int = CHEB_K, eps: float = 1e-6):
+    """
+    Apply W @ y(WᵀW) without SVD using Chebyshev approximation of y(·) on [0, λ_max].
+    W: [m,n]
+    y_fn: callable on t (eigenvalues of WᵀW), vectorized torch op -> y(t)
+    """
+    G = W.mT @ W  # [n,n], PSD
+    lam_max = _power_iteration_max_eig(G).item()  # scalar upper bound
+    # map [0, lam_max] -> [-1, 1]
+    a, b = lam_max / 2.0, max(lam_max / 2.0, eps)
+    I = torch.eye(G.size(-1), device=G.device, dtype=G.dtype)
+    X = (G - a * I) / b
+
+    # Fit Chebyshev coeffs on-the-fly
+    with torch.no_grad():
+        ts = torch.linspace(0.0, lam_max, 256, device=G.device, dtype=W.dtype)
+        xs = (ts - a) / b
+        ys = y_fn(ts)                           # [256]
+        T = torch.stack([torch.cos(i * torch.arccos(xs)) for i in range(K)], dim=1)  # [256,K]
+        # Least squares for coefficients
+        # upcast to float32 for the solve, then downcast back
+        b = ys.unsqueeze(1)
+        T32 = T.to(torch.float32)
+        b32 = b.to(torch.float32)
+
+        # Newer PyTorch returns an object with `.solution`
+        sol32 = torch.linalg.lstsq(T32, b32).solution  # shape: (K, 1)
+
+        coeffs = sol32.squeeze(1).to(T.dtype)
+        c = _solve_cheb_coeffs(T, ys)  # [K]
+
+    # Apply y(G) to RHS = Wᵀ (via Clenshaw recursion on columns of Wᵀ)
+    WT = W.mT  # [n,m]
+    b_kp1 = torch.zeros_like(WT)
+    b_k   = torch.zeros_like(WT)
+    for k in range(K - 1, 0, -1):
+        b_km1 = 2 * (X @ b_k) - b_kp1 + c[k] * WT
+        b_kp1, b_k = b_k, b_km1
+    YT = (X @ b_k) - b_kp1 + c[0] * WT
+    return YT.mT  # [m,n]
+
+def _y_piecewise(t: torch.Tensor, tau: float, a: float, eps: float = 1e-12):
+    """
+    y(t) = φ(√t)/√t with φ defined piecewise:
+      0                if s <= τ
+      a (s - τ)        if τ < s < τ + 1/a
+      1                if s >= τ + 1/a
+    where s = √t.
+    """
+    s = torch.sqrt(torch.clamp(t, min=eps))
+    y = torch.zeros_like(s)
+
+    # middle: τ < s < s_cap
+    s_cap = tau + 1.0 / a
+    mid = (s > tau) & (s < s_cap)
+    # φ(s) = a (s - τ) -> y = φ(s)/s = a * (1 - τ/s)
+    y[mid] = a * (1.0 - tau / s[mid])
+
+    # cap to NS: y = 1/s (i.e., φ(s)=1) for s >= s_cap
+    cap = s >= s_cap
+    y[cap] = 1.0 / s[cap]
+
+    # small singulars remain 0
+    return torch.clamp(y, min=0.0)
+
+def piecewise_map_single(W: torch.Tensor, tau: float = PIECE_TAU, a: float = PIECE_SLOPE):
+    y_fn = lambda t: _y_piecewise(t, tau=tau, a=a)
+    return _chebyshev_apply_right(W, y_fn, K=CHEB_K)
+
+@torch.no_grad()
+def piecewise_map_batched(WB: torch.Tensor, tau: float = PIECE_TAU, a: float = PIECE_SLOPE) -> torch.Tensor:
+    """
+    WB: [B,m,n] or [m,n] -> returns same shape, applying the piecewise spectral map
+    """
+    if WB.ndim == 2:
+        return piecewise_map_single(WB, tau=tau, a=a)
+    B = WB.size(0)
+    out = torch.empty_like(WB)
+    for i in range(B):
+        out[i] = piecewise_map_single(WB[i], tau=tau, a=a)
+    return out
+
+
 # Computed for num_iters=5, safety_factor=2e-2, cushion=2
 polar_express_coeffs = [
     (8.156554524902461, -22.48329292557795, 15.878769915207462),
@@ -379,14 +507,14 @@ polar_express_coeffs = [
 # slope fixed near 0.8 for stability
 NS_EQNS = [
     dict(name="noclip", clip_at=None, slope=0.8, iters=2, renorm_every=1, resid_exit=5e-3),
-    dict(name="clip0.05", clip_at=0.05, slope=0.8, iters=2, renorm_every=1, resid_exit=5e-3),
-    dict(name="clip0.10", clip_at=0.10, slope=0.8, iters=2, renorm_every=1, resid_exit=5e-3),
-    dict(name="clip0.15", clip_at=0.15, slope=0.8, iters=2, renorm_every=1, resid_exit=5e-3),
-    dict(name="clip0.20", clip_at=0.20, slope=0.8, iters=2, renorm_every=1, resid_exit=5e-3),
-    dict(name="clip0.25", clip_at=0.25, slope=0.8, iters=2, renorm_every=1, resid_exit=5e-3),
-    dict(name="clip0.30", clip_at=0.30, slope=0.8, iters=2, renorm_every=1, resid_exit=5e-3),
-    dict(name="clip0.35", clip_at=0.35, slope=0.8, iters=2, renorm_every=1, resid_exit=5e-3),
-    dict(name="clip0.40", clip_at=0.40, slope=0.8, iters=2, renorm_every=1, resid_exit=5e-3),
+    dict(name="clip0.05", clip_at=0.01, slope=0.8, iters=2, renorm_every=1, resid_exit=5e-3),
+    dict(name="clip0.10", clip_at=0.05, slope=0.8, iters=2, renorm_every=1, resid_exit=5e-3),
+    dict(name="clip0.15", clip_at=0.10, slope=0.8, iters=2, renorm_every=1, resid_exit=5e-3),
+    dict(name="clip0.20", clip_at=0.15, slope=0.8, iters=2, renorm_every=1, resid_exit=5e-3),
+    dict(name="clip0.25", clip_at=0.20, slope=0.8, iters=2, renorm_every=1, resid_exit=5e-3),
+    dict(name="clip0.30", clip_at=0.35, slope=0.8, iters=2, renorm_every=1, resid_exit=5e-3),
+    dict(name="clip0.35", clip_at=0.30, slope=0.8, iters=2, renorm_every=1, resid_exit=5e-3),
+    dict(name="clip0.40", clip_at=0.45, slope=0.8, iters=2, renorm_every=1, resid_exit=5e-3),
 ]
 
 # select by env var (fixed per run) or fall back to index 0
@@ -508,7 +636,6 @@ def polar_express(G: torch.Tensor):
     if G.size(-2) > G.size(-1):
         X = X.mT
     return X
-
 
 # -----------------------------------------------------------------------------
 # Muon optimizer
@@ -729,17 +856,19 @@ class Muon(torch.optim.Optimizer):
             original_shape = batched_update_grads.shape
             # Reshape attn params from [hdim, dim*4] to [4,hdim,dim] to apply polar_express independently to Q,K,V,O
             param_idx = start_idx if start_idx < len(params) else 0
+            # piecewise spectral mapping: 0 below τ, slope=a in middle, NS above cap
             if getattr(params[param_idx], 'label', None) == 'attn':
                 for p in params[param_idx:param_idx+chunk_size]:
-                    assert getattr(params[param_idx], 'label', None)=='attn', "GPU cannot mix attn and mlp params"
+                    assert getattr(params[param_idx], 'label', None) == 'attn', "GPU cannot mix attn and mlp params"
                 batch = 4 * original_shape[0]
-                d1 = original_shape[1] 
+                d1 = original_shape[1]
                 d2 = original_shape[2] // 4
                 batched = batched_update_grads.view(batch, d1, d2)
-                v_chunk = polar_express(batched)
+                v_chunk = piecewise_map_batched(batched)  # <-- changed
                 v_chunk = v_chunk.view(original_shape)
             else:
-                v_chunk = polar_express(batched_update_grads)
+                v_chunk = piecewise_map_batched(batched_update_grads)  # <-- changed
+
 
             # Add the computed zeropower update to the parameters in the buffer.
             # This loop applies the zeropower output (v_chunk) to the `updated_param_chunk` buffer.

@@ -8,8 +8,8 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=80G
 #SBATCH --array=0-8
-#SBATCH --output=/data/scratch/medhaven/logs/job_output_%A_%a.log
-#SBATCH --error=/data/scratch/medhaven/logs/job_output_%A_%a.err
+#SBATCH --output=/data/scratch/medhaven/logs/clipped_muon_%A_%a.log
+#SBATCH --error=/data/scratch/medhaven/logs/clipped_muon_%A_%a.err
 
 set -euo pipefail
 
