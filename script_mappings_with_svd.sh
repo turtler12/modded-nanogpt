@@ -3,7 +3,7 @@
 #SBATCH --account=lingo
 #SBATCH --partition=lingo-h100
 #SBATCH --qos=lingo-main
-#SBATCH --time=02:00:00
+#SBATCH --time=05:00:00
 #SBATCH --gpus=1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=80G

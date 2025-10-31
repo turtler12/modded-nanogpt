@@ -787,8 +787,70 @@ class DistAdam(torch.optim.Optimizer):
 
 # medhaven: added distributed SGD optimizer in the style of DistAdam
 
+def average_allreduce_grads_(model):
+    """All-reduce grads in-place and average them across ranks."""
+    world_size = dist.get_world_size()
+    for p in model.parameters():
+        if p.grad is None:
+            continue
+        dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+        p.grad.div_(world_size)
+
+
+class AllReduceSGD(torch.optim.Optimizer):
+    """
+    Robust distributed SGD: all-reduce grads for every param, then apply SGD.
+    No sharding, no aliasing, works for any shape. Momentum in FP32.
+    """
+    def __init__(self, params, lr=0.08, momentum=0.9, weight_decay=0.0, nesterov=True):
+        if nesterov and momentum == 0.0:
+            raise ValueError("Nesterov requires momentum > 0")
+        defaults = dict(lr=lr, momentum=momentum, weight_decay=weight_decay, nesterov=nesterov)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self):
+        world_size = dist.get_world_size()
+        # 1) sync & average grads
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                g = p.grad
+                dist.all_reduce(g, op=dist.ReduceOp.SUM)
+                g.div_(world_size)
+
+        # 2) apply SGD update (FP32 momentum, decoupled WD)
+        for group in self.param_groups:
+            lr = group["lr"]
+            mu = group["momentum"]
+            wd = group["weight_decay"]
+            nesterov = group["nesterov"]
+
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+
+                # decoupled WD
+                if wd != 0:
+                    p.mul_(1 - lr * wd * getattr(p, "wd_mul", 1.0))
+
+                # momentum buffer
+                state = self.state[p]
+                if "momentum_buffer" not in state:
+                    state["momentum_buffer"] = torch.zeros_like(p, dtype=torch.float32, device=p.device)
+                buf = state["momentum_buffer"]
+
+                g32 = p.grad.to(torch.float32)
+                buf.mul_(mu).add_(g32)                # m = μ m + g
+                upd32 = g32.add(buf, alpha=mu) if nesterov else buf
+                eff_lr = lr * getattr(p, "lr_mul", 1.0)
+                p.add_(upd32.to(p.dtype), alpha=-eff_lr)
+
+
 class DistSGD(torch.optim.Optimizer):
-    def __init__(self, params, lr: float = 0.03, momentum: float = 0.9, weight_decay: float = 0.0, nesterov: bool = False):
+    def __init__(self, params, lr: float = 0.08, momentum: float = 0.95,
+                 weight_decay: float = 0.0, nesterov: bool = True):
         if nesterov and momentum == 0.0:
             raise ValueError("Nesterov requires momentum > 0")
         defaults = dict(lr=lr, momentum=momentum, weight_decay=weight_decay, nesterov=nesterov)
@@ -799,75 +861,115 @@ class DistSGD(torch.optim.Optimizer):
             group_params = [p for p in params if p.shape == size]
             param_groups.append(dict(params=group_params))
         super().__init__(param_groups, defaults)
-        # distributed-SGD in the same style as DistAdam
 
     @torch.no_grad()
     def step(self):
         rank = dist.get_rank()
         world_size = dist.get_world_size()
-        reduce_scatter_futures: list[torch.Future] = []
-        all_gather_futures: list[torch.Future] = []
-        grad_slices = []
 
-        # 1) reduce_scatter grads into rank-local slices
-        for group in self.param_groups:
-            params: list[Tensor] = group["params"]
-            for param in params:
-                grad = param.grad
-                rank_size = grad.shape[0] // world_size
-                grad_slice = torch.empty_like(grad[:rank_size])
-                reduce_scatter_futures.append(
-                    dist.reduce_scatter_tensor(grad_slice, grad, op=dist.ReduceOp.AVG, async_op=True).get_future()
-                )
-                grad_slices.append(grad_slice)
+        reduce_scatter_futs: list[torch.Future] = []
+        # we need a place to stage local slices and book-keeping for each param
+        job = []  # per param: (group, param, mode, aux...)
 
-        # 2) per-group hyperparams and momentum buffers; update local slices
-        idx = 0
+        # --- 1) launch comms (reduce-scatter or all-reduce fallback) ---
         for group in self.param_groups:
-            lr = group["lr"]
+            base_lr = group["lr"]
             mu = group["momentum"]
             wd = group["weight_decay"]
             nesterov = group["nesterov"]
-            params = group["params"]
 
-            for param in params:
-                reduce_scatter_futures[idx].wait()
-                rank_size = param.shape[0] // world_size
-                p_slice = param[rank * rank_size:(rank + 1) * rank_size]
-                g_slice = grad_slices[idx]
+            for p in group["params"]:
+                g = p.grad
+                if g is None:
+                    job.append((group, p, "skip"))
+                    continue
 
-                # decoupled weight decay (matches your Adam style when wd>0)
-                if wd != 0:
-                    eff_weight_decay = lr * wd * getattr(param, "wd_mul", 1.0)
-                    p_slice.mul_(1 - eff_weight_decay)
+                # shardable only if dim0 >= world_size and divisible
+                shardable = (p.ndim >= 1) and (p.shape[0] % world_size == 0) and (p.shape[0] >= world_size)
 
-                # momentum state (store per-slice)
-                state = self.state[param]
-                if "momentum_buffer" not in state:
-                    state["momentum_buffer"] = torch.zeros_like(p_slice, dtype=p_slice.dtype, device=p_slice.device)
-                buf = state["momentum_buffer"]
-
-                # apply lr multipliers if present (consistent with your Adam path)
-                eff_lr = lr * getattr(param, "lr_mul", 1.0)
-
-                # momentum update
-                buf.mul_(mu).add_(g_slice)
-
-                # Nesterov or classical momentum
-                if nesterov:
-                    update = g_slice.add(buf, alpha=mu)
+                if shardable:
+                    rank_size = p.shape[0] // world_size
+                    g_slice = torch.empty_like(g[:rank_size])
+                    fut = dist.reduce_scatter_tensor(
+                        g_slice, g, op=dist.ReduceOp.AVG, async_op=True
+                    ).get_future()
+                    reduce_scatter_futs.append(fut)
+                    job.append((group, p, "sharded", rank_size, g_slice, fut))
                 else:
-                    update = buf
+                    # fallback: average full grad with all-reduce
+                    fut = dist.all_reduce(g, op=dist.ReduceOp.AVG, async_op=True).get_future()
+                    job.append((group, p, "fallback_full", g, fut))
 
-                p_slice.add_(update, alpha=-eff_lr)
+        # --- 2) apply updates (wait as needed) and launch all-gather for sharded ---
+        all_gather_futs = []
+        gather_targets = []  # (target_full, param)
+        for item in job:
+            mode = item[2]
+            if mode == "skip":
+                continue
 
-                # all_gather updated shards back to full param
-                idx += 1
-                all_gather_futures.append(
-                    dist.all_gather_into_tensor(param, p_slice, async_op=True).get_future()
-                )
+            group, p = item[0], item[1]
+            base_lr = group["lr"]
+            mu = group["momentum"]
+            wd = group["weight_decay"]
+            nesterov = group["nesterov"]
 
-        torch.futures.collect_all(all_gather_futures).wait()
+            eff_lr = base_lr * getattr(p, "lr_mul", 1.0)
+
+            if mode == "fallback_full":
+                g, fut = item[3], item[4]
+                fut.wait()
+
+                # decoupled weight decay
+                if wd != 0:
+                    p.mul_(1 - base_lr * wd * getattr(p, "wd_mul", 1.0))
+
+                state = self.state[p]
+                if "momentum_buffer" not in state:
+                    state["momentum_buffer"] = torch.zeros_like(p, dtype=torch.float32, device=p.device)
+                buf = state["momentum_buffer"]
+                g32 = g.to(torch.float32)
+
+                buf.mul_(mu).add_(g32)
+                upd32 = g32.add(buf, alpha=mu) if nesterov else buf
+                p.add_(upd32.to(p.dtype), alpha=-eff_lr)
+
+            elif mode == "sharded":
+                rank_size, g_slice, fut = item[3], item[4], item[5]
+                fut.wait()
+
+                # view of our shard
+                p_slice = p[rank * rank_size:(rank + 1) * rank_size]
+
+                # decoupled WD on shard
+                if wd != 0:
+                    p_slice.mul_(1 - base_lr * wd * getattr(p, "wd_mul", 1.0))
+
+                state = self.state[p]
+                if "momentum_buffer" not in state:
+                    state["momentum_buffer"] = torch.zeros_like(
+                        p_slice, dtype=torch.float32, device=p_slice.device
+                    )
+                buf = state["momentum_buffer"]
+                g32 = g_slice.to(torch.float32)
+
+                buf.mul_(mu).add_(g32)
+                upd32 = g32.add(buf, alpha=mu) if nesterov else buf
+                p_slice.add_(upd32.to(p_slice.dtype), alpha=-eff_lr)
+
+                # IMPORTANT: gather into a **separate** tensor, then copy into p
+                full_target = torch.empty_like(p)
+                gfut = dist.all_gather_into_tensor(full_target, p_slice, async_op=True).get_future()
+                all_gather_futs.append(gfut)
+                gather_targets.append((full_target, p))
+
+        # --- 3) finalize sharded params (copy gathered results into the live tensor) ---
+        if all_gather_futs:
+            torch.futures.collect_all(all_gather_futs).wait()
+            for full_target, p in gather_targets:
+                p.copy_(full_target)
+
+
 
 
 # -----------------------------------------------------------------------------
@@ -1116,7 +1218,9 @@ class GPT(nn.Module):
         bm_sizes = [None, short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, None, short_bm, short_bm, short_bm, long_bm]
         assert len(bm_sizes) == len(self.blocks)
 
-        x = self.embed(input_seq)
+        # medhaven: cast embeddings to bfloat16 to reduce memory usage
+        # x = self.embed(input_seq)
+        x = self.embed(input_seq).to(torch.bfloat16)
 
         # smear token embed forward 1 position @classiclarryd
         smear_lambda = self.scalars[5 * len(self.blocks)]
@@ -1427,9 +1531,10 @@ model: nn.Module = GPT(
     model_dim=768,
     max_seq_len=max(args.train_batch_size, args.val_batch_size) // (grad_accum_steps * world_size)
 ).cuda()
-for m in model.modules():
-    if isinstance(m, (nn.Embedding, nn.Linear)):
-        m.bfloat16()
+# medhaven: commenting out because it makes all the gradients 0 in sgd
+# for m in model.modules():
+#     if isinstance(m, (nn.Embedding, nn.Linear)):
+#         m.bfloat16()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
@@ -1586,12 +1691,12 @@ def build_optimizers(mode: str, model: nn.Module):
     elif mode == "sgd":
         # A solid starting point; feel free to sweep lr/momentum.
         all_params = list(model.parameters())
-        optimizer_sgd_all = DistSGD(
-            all_params, lr=0.03, momentum=0.9, weight_decay=0.0, nesterov=False
+        optimizer_sgd_all = torch.optim.SGD(
+            all_params, lr=0.04, momentum=0.9, nesterov=True, weight_decay=0.0
         )
         optimizers = [optimizer_sgd_all]
     else:
-        raise ValueError("mode must be 'muon' or 'adam'")
+        raise ValueError("mode must be 'muon' or 'adam' or 'sgd'")
 
     # stash initial lr
     for opt in optimizers:
@@ -1628,6 +1733,13 @@ def step_optimizers_muon_style(step: int, optimizers, model):
         # pure Adam baseline
         optimizers[0].step()
         model.zero_grad(set_to_none=True)
+
+def _probe_grad_norm(model):
+    with torch.no_grad():
+        for n, p in model.named_parameters():
+            if p.grad is not None and p.ndim >= 2:
+                return float(p.grad.norm().clamp_min(1e-12))
+    return 0.0
 
 def run_one_mode(mode: str):
     """
@@ -1710,6 +1822,10 @@ def run_one_mode(mode: str):
             inputs, targets, cum_seqlens = next(train_loader)
             model(inputs, targets, cum_seqlens, ws_short, ws_long).backward()
 
+        # If we're running the 1-optimizer SGD mode, explicitly average grads across ranks
+        if mode == "sgd":
+            average_allreduce_grads_(model)
+
         step_optimizers_muon_style(step, optimizers, model)
 
         approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
@@ -1723,19 +1839,22 @@ def run_one_mode(mode: str):
                  optimizers=[opt.state_dict() for opt in optimizers]),
             f"logs/{run_id}/state_{mode}_step{args.num_iterations:06d}.pt"
         )
+    if master_process and step % 250 == 0:
+        print0(f"[{mode}] grad_norm_probe: {_probe_grad_norm(model):.4e}", console=True)
+
 
     return steps_at_eval, val_losses
 
 # ---- Run both experiments and plot ----
-muon_steps, muon_vals = run_one_mode("muon")
-adam_steps, adam_vals = run_one_mode("adam")
+#muon_steps, muon_vals = run_one_mode("muon")
+#adam_steps, adam_vals = run_one_mode("adam")
 sgd_steps,  sgd_vals  = run_one_mode("sgd")
 
 if master_process:
     os.makedirs(f"logs/{run_id}", exist_ok=True)
     fig = plt.figure(figsize=(8, 5))
-    plt.plot(muon_steps, muon_vals, marker='o', label='DistAdam + Muon')
-    plt.plot(adam_steps, adam_vals, marker='s', label='Adam (distributed, all params)')
+    #plt.plot(muon_steps, muon_vals, marker='o', label='DistAdam + Muon')
+    #plt.plot(adam_steps, adam_vals, marker='s', label='Adam (distributed, all params)')
     plt.plot(sgd_steps,  sgd_vals,  marker='^', label='SGD (distributed, all params)')  # <-- NEW
     plt.xlabel("Training step")
     plt.ylabel("Validation loss")
