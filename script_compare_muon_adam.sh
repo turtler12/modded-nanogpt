@@ -1,9 +1,9 @@
 #!/bin/bash
-#SBATCH --job-name=compare_optimizers
+#SBATCH --job-name=compare_all_optimizers
 #SBATCH --account=lingo
 #SBATCH --partition=lingo-h100
 #SBATCH --qos=lingo-main
-#SBATCH --time=02:00:00
+#SBATCH --time=05:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4

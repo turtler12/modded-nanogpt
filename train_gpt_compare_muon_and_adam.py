@@ -1086,32 +1086,61 @@ class CausalSelfAttention(nn.Module):
         self.attn_gate.weight.detach().zero_()
 
     def forward(self, x: Tensor, attn_args: AttnArgs):
-        B, T = x.size(0), x.size(1) # batch size, sequence length
-        assert B == 1, "varlen sequences requires B == 1"
-        assert T % 16 == 0
-        # unpack attention args
-        cos, sin = attn_args.cos, attn_args.sin
-        ve, sa_lambdas = attn_args.ve, attn_args.sa_lambdas
-        seqlens, attn_scale, bm_size = attn_args.seqlens, attn_args.attn_scale, attn_args.bm_size
+        # x: [B, T, dim]; we keep everything in BF16
+        # Avoid local B/T to prevent Dynamo name capture issues.
+        assert x.size(0) == 1, "varlen path assumes B == 1"
+        assert (x.size(1) % 16) == 0, "sequence length must be a multiple of 16"
 
-        q, k, v = F.linear(x, self.qkvo_w.view(4, self.hdim, self.dim)[:3].flatten(end_dim=1).type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
-        q, k = norm(q), norm(k) # QK norm @Grad62304977
+        Bsz = x.size(0)  # 1
+        T   = x.size(1)
+
+        # Unpack attention args
+        cos, sin = attn_args.cos, attn_args.sin            # BF16 buffers
+        ve, sa_lambdas = attn_args.ve, attn_args.sa_lambdas.to(x.dtype)
+        seqlens = attn_args.seqlens                        # int32
+        attn_scale, bm_size = attn_args.attn_scale, attn_args.bm_size
+
+        # Project QKV in BF16
+        # Weight packing: qkvo_w.view(4, hdim, dim) where the first 3 are Q,K,V and the 4th is O
+        qkv_w = self.qkvo_w.view(4, self.hdim, self.dim)
+        qkv = F.linear(x, qkv_w[:3].flatten(end_dim=1).type_as(x)).view(Bsz, T, 3 * self.num_heads, self.head_dim)
+        q, k, v = qkv.chunk(3, dim=-2)
+
+        # Norm and RoPE (stays BF16)
+        q, k = norm(q), norm(k)
         q, k = rotary(q, cos, sin), rotary(k, cos, sin)
+
+        # Optional value-embed mix
         if ve is not None:
-            v = sa_lambdas[0] * v + sa_lambdas[1] * ve.view_as(v) # @ KoszarskyB & @Grad62304977
-        else: # skip mid-layers token value embeddings by @YouJiacheng
+            v = sa_lambdas[0] * v + sa_lambdas[1] * ve.view_as(v)
+        else:
             v = sa_lambdas[0] * v
 
-        max_len = args.train_max_seq_len if self.training else (args.val_batch_size // (grad_accum_steps * world_size))
+        # Max seqlen for varlen path
+        max_len = (args.train_max_seq_len if self.training
+                else (args.val_batch_size // (grad_accum_steps * dist.get_world_size())))
 
-        # use flash_attn over flex_attn @varunneal. flash_attn_varlen suggested by @YouJiacheng
-        y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens, max_seqlen_q=max_len, max_seqlen_k=max_len,
-                                   causal=True, softmax_scale=attn_scale, window_size=(bm_size, 0))
-        y = y.view(B, T, self.num_heads, self.head_dim)
-        y = y * torch.sigmoid(self.attn_gate(x[..., :self.attn_gate.weight.size(-1)])).view(B, T, self.num_heads, 1)
-        y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
-        y = F.linear(y, self.qkvo_w.view(4, self.hdim, self.dim)[3].type_as(y))
+        # FlashAttention-3 varlen API takes [T, H, Hd] for each batch; we pass batch 0.
+        # q[0], k[0], v[0] are BF16 thanks to the pipeline above.
+        y = flash_attn_interface.flash_attn_varlen_func(
+            q[0], k[0], v[0],
+            cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
+            max_seqlen_q=max_len, max_seqlen_k=max_len,
+            causal=True, softmax_scale=attn_scale, window_size=(bm_size, 0)
+        )
+        # y: [T, H, Hd] -> [B, T, H, Hd] with B==1, then merge heads
+        y = y.view(x.size(0), x.size(1), self.num_heads, self.head_dim)
+
+        # Per-token attention gating (BF16 safe)
+        gate_in = x[..., :self.attn_gate.weight.size(-1)]
+        y = y * torch.sigmoid(self.attn_gate(gate_in)).view(x.size(0), x.size(1), self.num_heads, 1)
+
+        y = y.contiguous().view(x.size(0), x.size(1), self.num_heads * self.head_dim)
+
+        # Output projection (O) in BF16
+        y = F.linear(y, qkv_w[3].type_as(y))
         return y
+
 
 class MLP(nn.Module):
     def __init__(self, dim: int):
@@ -1144,7 +1173,8 @@ class Block(nn.Module):
         self.mlp = MLP(dim) if layer_idx != 0 else None
 
     def forward(self, x: Tensor, x0: Tensor, lambdas: Tensor, attn_args: AttnArgs):
-        x = lambdas[0] * x + lambdas[1] * x0
+        lam = lambdas.to(x.dtype)
+        x = lam[0] * x + lam[1] * x0
         if self.attn is not None:
             x = x + self.attn(norm(x), attn_args)
         if self.mlp is not None:
@@ -1208,71 +1238,68 @@ class GPT(nn.Module):
         assert input_seq.ndim == 1
 
         ve = [value_embed(input_seq) for value_embed in self.value_embeds]
-        # 012 ... 012 structure on token value embeddings by @YouJiacheng, improved on @leloykun's U-net structure
-        # dropping first layer updates this to .12 ... 012
         ve = [None, ve[1], ve[2]] + [None] * (len(self.blocks) - 6) + [ve[0], ve[1], ve[2]]
         assert len(ve) == len(self.blocks)
 
         short_bm = ws_short * args.block_size
-        long_bm = ws_long * args.block_size
-        bm_sizes = [None, short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, None, short_bm, short_bm, short_bm, long_bm]
+        long_bm  = ws_long  * args.block_size
+        bm_sizes = [None, short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, None,
+                    short_bm, short_bm, short_bm, long_bm]
         assert len(bm_sizes) == len(self.blocks)
 
-        # medhaven: cast embeddings to bfloat16 to reduce memory usage
-        # x = self.embed(input_seq)
         x = self.embed(input_seq).to(torch.bfloat16)
+        D = x.dtype
 
-        # smear token embed forward 1 position @classiclarryd
-        smear_lambda = self.scalars[5 * len(self.blocks)]
-        smear_gate_out = smear_lambda * torch.sigmoid(self.smear_gate(x[1:, :self.smear_gate.weight.size(-1)]))
+        ve = [v.to(D) if v is not None else None for v in ve]
+        skip_weights   = self.scalars[:(len(self.blocks)//2)].to(D)
+        lambdas        = self.scalars[1*len(self.blocks):3*len(self.blocks)].view(-1,2).to(D)
+        sa_lambdas_all = self.scalars[3*len(self.blocks):5*len(self.blocks)].view(-1,2).to(D)
+        smear_lambda   = self.scalars[5*len(self.blocks)].to(D)
+        backout_lambda = self.scalars[5*len(self.blocks)+1].to(D)
+
+        smear_w = self.smear_gate.weight.size(-1)
+        smear_gate_out = smear_lambda * torch.sigmoid(self.smear_gate(x[1:, :smear_w]).to(D))
         x = torch.cat([x[:1], x[1:] + smear_gate_out * x[:-1]])
         x = x0 = norm(x[None])
 
-        # U-net design by @brendanh0gan
         skip_connections = []
-        skip_weights = self.scalars[:(len(self.blocks) // 2)]
-        lambdas = self.scalars[1 * len(self.blocks): 3 * len(self.blocks)].view(-1, 2)
-        sa_lambdas = self.scalars[3 * len(self.blocks): 5 * len(self.blocks)].view(-1, 2)
-        backout_lambda = self.scalars[5 * len(self.blocks)+1]
-
-        n = len(self.blocks) // 2
-
+        n = len(self.blocks)//2
         x_backout = None
         backout_layer = 8
-        # skip layer zero
-        for i in range(1,len(self.blocks)):
+
+        for i in range(1, len(self.blocks)):
             attn_args = AttnArgs(
                 ve=ve[i],
-                sa_lambdas=sa_lambdas[i],
+                sa_lambdas=sa_lambdas_all[i],
                 seqlens=seqlens,
                 bm_size=bm_sizes[i],
                 cos=self.yarn.cos,
                 sin=self.yarn.sin,
                 attn_scale=self.yarn.attn_scale
             )
-            # since layer 0 is skipped, layer 11 does not have skip_connection
-            if i >= n and i<11:
-                gate = torch.sigmoid(skip_weights[i - n])  # in (0, 1)
+            if i >= n and i < 11:
+                gate = torch.sigmoid(skip_weights[i - n])
                 x = x + gate * skip_connections.pop()
+
             x = self.blocks[i](x, x0, lambdas[i], attn_args)
             if i < n:
                 skip_connections.append(x)
-            if i == backout_layer:
-                x_backout = x
+            if i == backout_layer: x_backout = x
 
-        # back out contributions from first 8 layers that are only required for downstream context and not direct prediction
-        x -= backout_lambda * x_backout
+        x = x - backout_lambda * x_backout
         x = norm(x)
-        logits = self.lm_head(x)
-        # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
-        logits = 30 * torch.sigmoid(logits / 7.5)
-        logits_for_loss = logits.float() if not self.training else logits
+
+        raw_logits = self.lm_head(x)          # BF16 tensor
+        # IMPORTANT: compute loss in FP32 to avoid BF16 overflow/NaNs with SGD
         loss = F.cross_entropy(
-            logits_for_loss.view(-1, logits_for_loss.size(-1)),
+            raw_logits.float().view(-1, raw_logits.size(-1)),
             target_seq,
             reduction="sum" if self.training else "mean",
         )
         return loss
+
+
+
 
 # -----------------------------------------------------------------------------
 # Distributed data loader
@@ -1689,8 +1716,8 @@ def build_optimizers(mode: str, model: nn.Module):
         )
         optimizers = [optimizer_adam_all]
     elif mode == "sgd":
-        # A solid starting point; feel free to sweep lr/momentum.
         all_params = list(model.parameters())
+        # conservative LR; you can try 5e-3 → 1e-2 later
         optimizer_sgd_all = torch.optim.SGD(
             all_params, lr=0.04, momentum=0.9, nesterov=True, weight_decay=0.0
         )
@@ -1705,34 +1732,25 @@ def build_optimizers(mode: str, model: nn.Module):
     return optimizers
 
 def step_optimizers_muon_style(step: int, optimizers, model):
-    """
-    Matches your existing stepping behavior:
-      - Updates LR schedule for all optimizers
-      - For 'muon' config: even steps update only Muon; odd steps update both
-      - For 'adam' config (single optimizer): step every iteration
-    """
-    # LR schedule
     for optimizer in optimizers:
         for group in optimizer.param_groups:
             group["lr"] = group["initial_lr"] * get_lr(step)
 
     if len(optimizers) == 2:
-        # set Muon momentum schedule
         momentum = get_muon_momentum(step)
         for group in optimizers[1].param_groups:
             group["momentum"] = momentum
-
         if step % 2 == 0:
             optimizers[1].step()
             optimizers[1].zero_grad(set_to_none=True)
         else:
-            for opt in optimizers:
-                opt.step()
+            for opt in optimizers: opt.step()
             model.zero_grad(set_to_none=True)
     else:
-        # pure Adam baseline
         optimizers[0].step()
         model.zero_grad(set_to_none=True)
+
+
 
 def _probe_grad_norm(model):
     with torch.no_grad():
@@ -1749,6 +1767,8 @@ def run_one_mode(mode: str):
     # reset model + yarn + optimizers to warmup snapshot
     model.yarn.reset()
     model.load_state_dict(WARMUP_SNAPSHOT["model"])
+    if mode == "sgd" and hasattr(model.lm_head, "use_fp8"):
+        model.lm_head.use_fp8 = False
 
     optimizers = build_optimizers(mode, model)
     if mode == "muon":
@@ -1826,6 +1846,29 @@ def run_one_mode(mode: str):
         if mode == "sgd":
             average_allreduce_grads_(model)
 
+            # 1) grad clipping in FP32 for stability
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+            # 2) finite-grad check: if any grad is NaN/Inf, skip the step
+            grads_finite = True
+            with torch.no_grad():
+                for p in model.parameters():
+                    if p.grad is not None:
+                        if not torch.isfinite(p.grad).all():
+                            grads_finite = False
+                            break
+            if not grads_finite:
+                # zero and continue without stepping; prevents corrupting weights
+                for p in model.parameters():
+                    if p.grad is not None:
+                        p.grad.zero_()
+                print0("[sgd] skipped step due to non-finite grads", console=True)
+                # restart timer baseline so step_avg remains sane
+                torch.cuda.synchronize()
+                t0 = time.perf_counter()
+                continue
+
+
         step_optimizers_muon_style(step, optimizers, model)
 
         approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
@@ -1846,15 +1889,15 @@ def run_one_mode(mode: str):
     return steps_at_eval, val_losses
 
 # ---- Run both experiments and plot ----
-#muon_steps, muon_vals = run_one_mode("muon")
-#adam_steps, adam_vals = run_one_mode("adam")
+muon_steps, muon_vals = run_one_mode("muon")
+adam_steps, adam_vals = run_one_mode("adam")
 sgd_steps,  sgd_vals  = run_one_mode("sgd")
 
 if master_process:
     os.makedirs(f"logs/{run_id}", exist_ok=True)
     fig = plt.figure(figsize=(8, 5))
-    #plt.plot(muon_steps, muon_vals, marker='o', label='DistAdam + Muon')
-    #plt.plot(adam_steps, adam_vals, marker='s', label='Adam (distributed, all params)')
+    plt.plot(muon_steps, muon_vals, marker='o', label='DistAdam + Muon')
+    plt.plot(adam_steps, adam_vals, marker='s', label='Adam (distributed, all params)')
     plt.plot(sgd_steps,  sgd_vals,  marker='^', label='SGD (distributed, all params)')  # <-- NEW
     plt.xlabel("Training step")
     plt.ylabel("Validation loss")

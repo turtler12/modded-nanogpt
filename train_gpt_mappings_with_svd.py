@@ -430,6 +430,31 @@ def svd_map_identity(s: torch.Tensor) -> torch.Tensor:
 
 # can add more functions here for different mappings
 
+# -------- SVD y-clip mappings --------
+def make_svd_map_yclip(c: float, normalize: bool = True):
+    """
+    Piecewise y-clip mapping:
+        if normalize:  s_hat = s / s_max  (per-matrix)
+                       f_c(s) = min(1, s_hat / c)
+        else:          f_c(s) = min(1, s / c)
+
+    normalize=True matches the 0..1 sketch and keeps the op-norm <= 1.
+    """
+    c = float(c)
+    def _map(s: torch.Tensor) -> torch.Tensor:
+        if normalize:
+            s_max = s.amax(dim=-1, keepdim=True).clamp_min(1e-12)
+            s_hat = s / s_max
+            return torch.clamp(s_hat / c, max=1.0)
+        else:
+            return torch.clamp(s / c, max=1.0)
+    return _map
+
+def parse_bool_env(name: str, default: bool) -> bool:
+    v = os.environ.get(name, str(int(default))).lower()
+    return v in ("1", "true", "t", "yes", "y")
+
+
 
 
 # -----------------------------------------------------------------------------
@@ -1330,6 +1355,16 @@ class Hyperparameters:
 
 args = Hyperparameters()
 
+# medhaven: helper functions for mapping selection from environment for y clips
+# --- mapping selection from environment ---
+YCLIP = float(os.environ.get("YCLIP", "1.0"))          # 0.1 .. 1.0
+YCLIP_NORMALIZE = parse_bool_env("YCLIP_NORMALIZE", True)  # default normalized
+svd_map_fn_selected = make_svd_map_yclip(YCLIP, normalize=YCLIP_NORMALIZE)
+
+# Optional: tag the run id with the clip for easier log grep
+args.run_id = f"yclip{int(round(YCLIP*100)):02d}_{args.run_id}"
+
+
 data_path = os.environ.get("DATA_PATH", ".")
 args.train_files = os.path.join(data_path, args.train_files)
 args.val_files = os.path.join(data_path, args.val_files)
@@ -1406,11 +1441,17 @@ optimizer1 = DistAdam(
     weight_decay=0.0,
 )
 # medhaven: edit this to change the mapping and muon params and whether you use SVD
+# optimizer2 = Muon(
+#     hidden_matrix_params + gate_params,
+#     lr=0.06, momentum=0.95, weight_decay=0.0,
+#     use_svd_mapping=True,            # turn on SVD-based mapping
+#     svd_map_fn=svd_map_identity      # f(σ)=σ to start
+# )
 optimizer2 = Muon(
     hidden_matrix_params + gate_params,
     lr=0.06, momentum=0.95, weight_decay=0.0,
-    use_svd_mapping=True,            # turn on SVD-based mapping
-    svd_map_fn=svd_map_identity      # f(σ)=σ to start
+    use_svd_mapping=True,
+    svd_map_fn=svd_map_fn_selected
 )
 optimizers = [optimizer1, optimizer2]
 for opt in optimizers:
