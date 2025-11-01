@@ -450,12 +450,25 @@ def make_svd_map_yclip(c: float, normalize: bool = True):
             return torch.clamp(s / c, max=1.0)
     return _map
 
-def parse_bool_env(name: str, default: bool) -> bool:
-    v = os.environ.get(name, str(int(default))).lower()
-    return v in ("1", "true", "t", "yes", "y")
-
-
-
+# -------- SVD affine (intercept) mapping --------
+def make_svd_map_affine(intercept: float, normalize: bool = True):
+    """
+    Linear map on [0,1]:  f_i(x) = (1 - i)*x + i
+      - If normalize=True, use x = s / s_max  (per matrix), guaranteeing op-norm <= 1.
+      - Else, approximate by clamping to [0,1] after scaling (safer to keep True).
+    """
+    i = float(intercept)
+    def _map(s: torch.Tensor) -> torch.Tensor:
+        if normalize:
+            s_max = s.amax(dim=-1, keepdim=True).clamp_min(1e-12)
+            x = s / s_max                         # x in [0,1]
+            y = (1.0 - i) * x + i                 # in [i,1]
+            return y
+        else:
+            # Without normalization, keep things safe:
+            y = (1.0 - i) * s + i
+            return torch.clamp(y, max=1.0)
+    return _map
 
 # -----------------------------------------------------------------------------
 # Muon optimizer
@@ -1354,6 +1367,30 @@ class Hyperparameters:
     ws_validate_post_yarn_ext: int = 20 # extend long windows out even further after applying YaRN
 
 args = Hyperparameters()
+
+def parse_bool_env(name: str, default: bool) -> bool:
+    v = os.environ.get(name, str(int(default))).lower()
+    return v in ("1", "true", "t", "yes", "y")
+
+# --- mapping selection from environment ---
+# MAP_KIND: "affine" (y = (1-i)*x + i) or "yclip"
+MAP_KIND = os.environ.get("MAP_KIND", "affine").lower()
+MAP_NORMALIZE = parse_bool_env("MAP_NORMALIZE", True)
+
+if MAP_KIND == "affine":
+    INTERCEPT = float(os.environ.get("INTERCEPT", "1.0"))   # 0.1..1.0
+    svd_map_fn_selected = make_svd_map_affine(INTERCEPT, normalize=MAP_NORMALIZE)
+    tag = f"aff{int(round(INTERCEPT*100)):02d}"
+elif MAP_KIND == "yclip":
+    YCLIP = float(os.environ.get("YCLIP", "1.0"))            # 0.1..1.0
+    svd_map_fn_selected = make_svd_map_yclip(YCLIP, normalize=MAP_NORMALIZE)
+    tag = f"yclip{int(round(YCLIP*100)):02d}"
+else:
+    raise ValueError(f"Unknown MAP_KIND={MAP_KIND}")
+
+# tag the run for easier grep
+args.run_id = f"{tag}_{args.run_id}"
+
 
 # medhaven: helper functions for mapping selection from environment for y clips
 # --- mapping selection from environment ---
