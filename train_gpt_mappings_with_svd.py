@@ -430,6 +430,19 @@ def svd_map_identity(s: torch.Tensor) -> torch.Tensor:
 
 # can add more functions here for different mappings
 
+def _match_norm(s_new, s, mode: str | None):
+    if mode is None:
+        return s_new
+    eps = 1e-12
+    if mode == "spectral":
+        return s_new / s_new.amax(-1, keepdim=True).clamp_min(eps) * s.amax(-1, keepdim=True)
+    if mode == "nuclear":
+        return s_new * (s.sum(-1, keepdim=True) / s_new.sum(-1, keepdim=True).clamp_min(eps))
+    if mode == "fro":
+        return s_new * (torch.linalg.norm(s, dim=-1, keepdim=True) /
+                        torch.linalg.norm(s_new, dim=-1, keepdim=True).clamp_min(eps))
+    raise ValueError(mode)
+
 # -------- SVD y-clip mappings --------
 def make_svd_map_yclip(c: float, normalize: bool = True):
     """
@@ -444,10 +457,12 @@ def make_svd_map_yclip(c: float, normalize: bool = True):
     def _map(s: torch.Tensor) -> torch.Tensor:
         if normalize:
             s_max = s.amax(dim=-1, keepdim=True).clamp_min(1e-12)
-            s_hat = s / s_max
-            return torch.clamp(s_hat / c, max=1.0)
+            x = s / s_max                      # in [0,1]
+            y = torch.clamp(x / c, max=1.0)    # in [0,1]
+            s_new = y * s_max                  # <<< de-normalize
         else:
-            return torch.clamp(s / c, max=1.0)
+            s_new = torch.clamp(s / c, max=1.0)
+        return _match_norm(s_new, s, keep_norm)
     return _map
 
 # -------- SVD affine (intercept) mapping --------
@@ -457,17 +472,17 @@ def make_svd_map_affine(intercept: float, normalize: bool = True):
       - If normalize=True, use x = s / s_max  (per matrix), guaranteeing op-norm <= 1.
       - Else, approximate by clamping to [0,1] after scaling (safer to keep True).
     """
-    i = float(intercept)
+    i = float(i)
     def _map(s: torch.Tensor) -> torch.Tensor:
         if normalize:
             s_max = s.amax(dim=-1, keepdim=True).clamp_min(1e-12)
-            x = s / s_max                         # x in [0,1]
-            y = (1.0 - i) * x + i                 # in [i,1]
-            return y
+            x = s / s_max                      # in [0,1]
+            y = (1.0 - i) * x + i              # in [i,1]
+            s_new = y * s_max                  # <<< de-normalize
         else:
-            # Without normalization, keep things safe:
             y = (1.0 - i) * s + i
-            return torch.clamp(y, max=1.0)
+            s_new = torch.clamp(y, max=s.amax(dim=-1, keepdim=True))
+        return _match_norm(s_new, s, keep_norm)
     return _map
 
 # -----------------------------------------------------------------------------
@@ -1385,21 +1400,14 @@ elif MAP_KIND == "yclip":
     YCLIP = float(os.environ.get("YCLIP", "1.0"))            # 0.1..1.0
     svd_map_fn_selected = make_svd_map_yclip(YCLIP, normalize=MAP_NORMALIZE)
     tag = f"yclip{int(round(YCLIP*100)):02d}"
+elif MAP_KIND == "identity":
+    svd_map_fn_selected = svd_map_identity
+    tag = "identity"
 else:
     raise ValueError(f"Unknown MAP_KIND={MAP_KIND}")
 
 # tag the run for easier grep
 args.run_id = f"{tag}_{args.run_id}"
-
-
-# medhaven: helper functions for mapping selection from environment for y clips
-# --- mapping selection from environment ---
-YCLIP = float(os.environ.get("YCLIP", "1.0"))          # 0.1 .. 1.0
-YCLIP_NORMALIZE = parse_bool_env("YCLIP_NORMALIZE", True)  # default normalized
-svd_map_fn_selected = make_svd_map_yclip(YCLIP, normalize=YCLIP_NORMALIZE)
-
-# Optional: tag the run id with the clip for easier log grep
-args.run_id = f"yclip{int(round(YCLIP*100)):02d}_{args.run_id}"
 
 
 data_path = os.environ.get("DATA_PATH", ".")
