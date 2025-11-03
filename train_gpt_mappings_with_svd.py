@@ -485,6 +485,29 @@ def make_svd_map_affine(intercept: float, normalize: bool = True):
         return _match_norm(s_new, s, keep_norm)
     return _map
 
+# -------- SVD polar (exact polar factor in SVD space) --------
+def make_svd_map_polar(normalize: bool = True, cushion: float = 2e-2):
+    """
+    SVD proxy for Polar Express (matrix sign / polar factor).
+    If X = U diag(s) V^T, the polar factor is U V^T, which corresponds to mapping s -> 1.
+    We treat it like other SVD maps: return the *new singular values*.
+
+    normalize=True:
+        Return ones_like(s). Since _svd_map_batched uses U * S_new * Vh, this yields op-norm = 1,
+        matching the behavior of Polar Express after its pre-normalization.
+    normalize=False:
+        Conservative fallback that keeps op-norm ≤ 1 by dividing by s_max.
+    """
+    def _map(s: torch.Tensor) -> torch.Tensor:
+        if normalize:
+            # Exact polar factor in SVD space: all singular values -> 1
+            return torch.ones_like(s)
+        else:
+            # Keep op-norm ≤ 1 without per-matrix normalization
+            s_max = s.amax(dim=-1, keepdim=True).clamp_min(1e-12)
+            return torch.clamp(s / s_max, max=1.0)
+    return _map
+
 # -----------------------------------------------------------------------------
 # Muon optimizer
 
