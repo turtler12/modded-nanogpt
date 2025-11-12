@@ -427,6 +427,27 @@ def svd_map_identity(s: torch.Tensor) -> torch.Tensor:
     """Identity mapping f(σ)=σ."""
     return s
 
+# replace the existing svd_my_function with this
+def svd_step_0_1(s: torch.Tensor, eps: float = 0.0) -> torch.Tensor:
+    """
+    step function from 0 to 1
+    Step map at x=0:
+      f(σ) = 0 if σ <= eps
+           = 1 if σ >  eps
+    """
+    return s.gt(eps).to(s.dtype)
+
+def svd_step_neg1_1(s: torch.Tensor, eps: float = 0.0) -> torch.Tensor:
+    """
+    Step function from -1 to +1.
+
+    Step map at x = 0:
+      f(σ) = -1 if σ <= eps
+           = +1 if σ >  eps
+    """
+    return torch.where(s > eps, torch.ones_like(s), -torch.ones_like(s))
+
+
 
 # can add more functions here for different mappings
 
@@ -472,17 +493,17 @@ def make_svd_map_affine(intercept: float, normalize: bool = True):
       - If normalize=True, use x = s / s_max  (per matrix), guaranteeing op-norm <= 1.
       - Else, approximate by clamping to [0,1] after scaling (safer to keep True).
     """
-    i = float(i)
+    i = float(intercept)
     def _map(s: torch.Tensor) -> torch.Tensor:
         if normalize:
             s_max = s.amax(dim=-1, keepdim=True).clamp_min(1e-12)
             x = s / s_max                      # in [0,1]
             y = (1.0 - i) * x + i              # in [i,1]
-            s_new = y * s_max                  # <<< de-normalize
+            s_new = y * s_max                  # de-normalize
         else:
             y = (1.0 - i) * s + i
             s_new = torch.clamp(y, max=s.amax(dim=-1, keepdim=True))
-        return _match_norm(s_new, s, keep_norm)
+        return s_new
     return _map
 
 # -------- SVD polar (exact polar factor in SVD space) --------
@@ -1411,7 +1432,7 @@ def parse_bool_env(name: str, default: bool) -> bool:
     return v in ("1", "true", "t", "yes", "y")
 
 # --- mapping selection from environment ---
-# MAP_KIND: "affine" (y = (1-i)*x + i) or "yclip"
+# MAP_KIND: "identity", "affine", "yclip", or "polar"
 MAP_KIND = os.environ.get("MAP_KIND", "affine").lower()
 MAP_NORMALIZE = parse_bool_env("MAP_NORMALIZE", True)
 
@@ -1426,6 +1447,13 @@ elif MAP_KIND == "yclip":
 elif MAP_KIND == "identity":
     svd_map_fn_selected = svd_map_identity
     tag = "identity"
+elif MAP_KIND == "polar":
+    # Exact SVD-side equivalent of the Polar Express orthogonalization
+    svd_map_fn_selected = make_svd_map_polar(normalize=MAP_NORMALIZE)
+    tag = "polar"
+elif MAP_KIND == "my_function":
+    svd_map_fn_selected = svd_step_neg1_1
+    tag = "my_function"
 else:
     raise ValueError(f"Unknown MAP_KIND={MAP_KIND}")
 
