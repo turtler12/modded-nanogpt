@@ -485,22 +485,6 @@ def make_svd_map_yclip(c: float, normalize: bool = True):
         return _match_norm(s_new, s, keep_norm)
     return _map
 
-# ---- Step map params from env ----
-
-def step_map(sigma: torch.Tensor) -> torch.Tensor:
-    """
-    Step function on singular values.
-      - MAP_RANGE="0_1":   outputs {0, 1}
-      - MAP_RANGE="m1_1":  outputs {-1, 1}
-      - Threshold at MAP_EPS.
-    """
-    if MAP_RANGE == "0_1":
-        return torch.where(sigma >= MAP_EPS, torch.ones_like(sigma), torch.zeros_like(sigma))
-    elif MAP_RANGE == "m1_1":
-        return torch.where(sigma >= MAP_EPS, torch.ones_like(sigma), -torch.ones_like(sigma))
-    else:
-        raise ValueError(f"Unknown MAP_RANGE={MAP_RANGE}")
-
 # -------- SVD affine (intercept) mapping --------
 def make_svd_map_affine(intercept: float, normalize: bool = True):
     """
@@ -544,6 +528,71 @@ def make_svd_map_polar(normalize: bool = True, cushion: float = 2e-2):
             return torch.clamp(s / s_max, max=1.0)
     return _map
 
+# -----------------------------------------------------------------------------
+
+# -------- Custom SVD mapping for overshoot vs non-overshoot --------
+def make_svd_map_my_function(normalize: bool = True, overshoot: bool = False):
+    """Custom singular-value mapping used for the overshoot experiment.
+
+    We first (optionally) normalize singular values s by their per-matrix maximum
+    so that x = s / s_max lies in [0, 1]. The mapping is then defined in terms of x.
+
+    Non-overshoot (overshoot=False):
+        Linear slope up to (0.07, 1), then horizontal:
+            f(x) = min(1, x / 0.07).
+
+    Overshoot (overshoot=True):
+        Piecewise-linear interpolation through:
+            (0.00, 0.00)
+            (0.01, 1.16)
+            (0.04, 0.98)
+            (0.07, 1.00)
+        and then horizontal at 1.0 for x >= 0.07.
+    """
+    def _map(s: torch.Tensor) -> torch.Tensor:
+        # Optional normalization so that typical x is in [0,1]
+        if normalize:
+            s_max = s.amax(dim=-1, keepdim=True).clamp_min(1e-12)
+            x = s / s_max
+        else:
+            x = s
+
+        if overshoot:
+            # Initialize with zeros (covers x <= 0 implicitly).
+            y = torch.zeros_like(x)
+
+            # Segment 1: [0, 0.01] between (0.00,0.00) and (0.01,1.16)
+            m1 = 116.0  # 1.16 / 0.01
+            mask1 = x <= 0.01
+            y[mask1] = m1 * x[mask1]
+
+            # Segment 2: (0.01, 0.04] between (0.01,1.16) and (0.04,0.98)
+            m2 = -6.0
+            b2 = 1.22   # 1.16 - m2*0.01
+            mask2 = (x > 0.01) & (x <= 0.04)
+            y[mask2] = m2 * x[mask2] + b2
+
+            # Segment 3: (0.04, 0.07] between (0.04,0.98) and (0.07,1.00)
+            m3 = 2.0 / 3.0
+            b3 = 0.9533333333333333  # 0.98 - m3*0.04
+            mask3 = (x > 0.04) & (x <= 0.07)
+            y[mask3] = m3 * x[mask3] + b3
+
+            # Segment 4: x > 0.07 -> y = 1.0
+            mask4 = x > 0.07
+            y[mask4] = 1.0
+        else:
+            # Simple non-overshooting linear ramp to (0.07, 1) then flat.
+            y = torch.clamp(x / 0.07, max=1.0)
+
+        # Map back to singular values.
+        if normalize:
+            s_new = y * s_max
+        else:
+            s_new = y
+        return s_new
+
+    return _map
 # -----------------------------------------------------------------------------
 # Muon optimizer
 
@@ -1447,10 +1496,9 @@ def parse_bool_env(name: str, default: bool) -> bool:
     return v in ("1", "true", "t", "yes", "y")
 
 # --- mapping selection from environment ---
-MAP_KIND      = os.getenv("MAP_KIND", "identity")   # "step" to activate
-MAP_EPS       = float(os.getenv("MAP_EPS", "0.0"))  # threshold
-MAP_RANGE     = os.getenv("MAP_RANGE", "0_1")       # "0_1" or "m1_1"
-MAP_NORMALIZE = int(os.getenv("MAP_NORMALIZE", "1"))  # keep your existing usage
+# MAP_KIND: "identity", "affine", "yclip", or "polar"
+MAP_KIND = os.environ.get("MAP_KIND", "affine").lower()
+MAP_NORMALIZE = parse_bool_env("MAP_NORMALIZE", True)
 
 if MAP_KIND == "affine":
     INTERCEPT = float(os.environ.get("INTERCEPT", "1.0"))   # 0.1..1.0
@@ -1468,15 +1516,14 @@ elif MAP_KIND == "polar":
     svd_map_fn_selected = make_svd_map_polar(normalize=MAP_NORMALIZE)
     tag = "polar"
 elif MAP_KIND == "my_function":
-    svd_map_fn_selected = svd_step_0_1
-    tag = "my_function"
-elif MAP_KIND == "step":
-    # Wrap the step_map so callsite stays consistent: sigma = svd_map_fn_selected(sigma)
-    def svd_map_fn_selected(s: torch.Tensor) -> torch.Tensor:
-        return step_map(s)
-    tag = f"step_{MAP_RANGE}_eps_{MAP_EPS:g}"
+    # Custom overshoot vs non-overshoot mapping (controlled by OVERSHOOT env var)
+    OVERSHOOT = parse_bool_env("OVERSHOOT", False)
+    svd_map_fn_selected = make_svd_map_my_function(normalize=MAP_NORMALIZE,
+                                                   overshoot=OVERSHOOT)
+    tag = "my_over" if OVERSHOOT else "my_linear"
 else:
     raise ValueError(f"Unknown MAP_KIND={MAP_KIND}")
+
 
 # tag the run for easier grep
 args.run_id = f"{tag}_{args.run_id}"

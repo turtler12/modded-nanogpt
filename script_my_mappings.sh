@@ -12,5 +12,7 @@
 
 export MAP_KIND="my_function"   # uses svd_map_identity in your code
 
+# comparing overshooting
+
 echo "[cfg] MAP_KIND=$MAP_KIND MAP_NORMALIZE=$MAP_NORMALIZE"
 torchrun --standalone --nproc_per_node=1 train_gpt_mappings_with_svd.py
