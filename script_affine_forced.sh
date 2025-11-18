@@ -4,15 +4,15 @@
 #SBATCH --partition=lingo-h100
 #SBATCH --qos=lingo-main
 #SBATCH --time=05:00:00
-#SBATCH --array=1-11
+#SBATCH --array=0-5%3
 #SBATCH --gpus=1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=80G
+#SBATCH --mem=16G
 #SBATCH --output=/data/scratch/medhaven/logs/affine_forced_%A_%a.log
 #SBATCH --error=/data/scratch/medhaven/logs/affine_forced_%A_%a.err
 
 # List of intercepts, one per array task (1..11)
-INTERCEPTS=(0 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1.0)
+INTERCEPTS=(0.5 0.6 0.7 0.8 0.9 1.0)
 
 # Map SLURM_ARRAY_TASK_ID (1–11) -> corresponding intercept
 idx=$((SLURM_ARRAY_TASK_ID - 1))

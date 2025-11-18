@@ -1489,7 +1489,7 @@ elif MAP_KIND == "polar":
     svd_map_fn_selected = make_svd_map_polar(normalize=MAP_NORMALIZE)
     tag = "polar"
 elif MAP_KIND == "my_function":
-    svd_map_fn_selected = svd_step_0_1
+    svd_map_fn_selected = svd_map_identity
     tag = "my_function"
 elif MAP_KIND == "step":
     # Wrap the step_map so callsite stays consistent: sigma = svd_map_fn_selected(sigma)
