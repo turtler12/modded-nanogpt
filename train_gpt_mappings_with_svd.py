@@ -502,24 +502,45 @@ def step_map(sigma: torch.Tensor) -> torch.Tensor:
         raise ValueError(f"Unknown MAP_RANGE={MAP_RANGE}")
 
 # -------- SVD affine (intercept) mapping --------
+# medhaven: fixed so that it sets all singular values to within 0 and 1 at the end
 def make_svd_map_affine(intercept: float, normalize: bool = True):
     """
-    Linear map on [0,1]:  f_i(x) = (1 - i)*x + i
-      - If normalize=True, use x = s / s_max  (per matrix), guaranteeing op-norm <= 1.
-      - Else, approximate by clamping to [0,1] after scaling (safer to keep True).
+    Affine family that interpolates between:
+      - intercept = 0:   normalized identity      (s_norm)
+      - intercept = 1:   normalized step mapping ((s_norm > 0) -> 1, zeros stay 0)
+
+    With normalize=True this behaves like your SVD+step map:
+      • we first normalize by s_max so singulars are in [0, 1]
+      • then apply a convex combination between s_norm and the step(0) map
+      • we DO NOT rescale back by s_max, so op-norm <= 1 and
+        intercept=1 matches the SVD+step behavior.
     """
     i = float(intercept)
+
     def _map(s: torch.Tensor) -> torch.Tensor:
         if normalize:
+            # normalize to [0,1] by max singular value
             s_max = s.amax(dim=-1, keepdim=True).clamp_min(1e-12)
-            x = s / s_max                      # in [0,1]
-            y = (1.0 - i) * x + i              # in [i,1]
-            s_new = y * s_max                  # de-normalize
+            s_norm = s / s_max
+
+            # step with epsilon = 0 on normalized singulars
+            step = (s_norm > 0).to(s.dtype)   # all positives -> 1, exact zeros -> 0
+
+            # affine interpolation in [0,1]:
+            #   i = 0 -> s_norm         (identity on normalized spectrum)
+            #   i = 1 -> step           (all positive -> 1)
+            s_mixed = (1.0 - i) * s_norm + i * step
+
+            # IMPORTANT: do NOT multiply back by s_max
+            # This keeps op-norm <= 1 and makes i=1 exactly match SVD+step.
+            return s_mixed
         else:
-            y = (1.0 - i) * s + i
-            s_new = torch.clamp(y, max=s.amax(dim=-1, keepdim=True))
-        return s_new
+            # No normalization case: interpolate between raw spectrum and raw step.
+            step = (s > 0).to(s.dtype)
+            return (1.0 - i) * s + i * step
+
     return _map
+
 
 # -------- SVD polar (exact polar factor in SVD space) --------
 def make_svd_map_polar(normalize: bool = True, cushion: float = 2e-2):
