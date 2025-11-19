@@ -101,6 +101,50 @@ def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
         X = X.mT
     return X
 
+# -----------------------------------------------------------------------------
+# SVD mapping utilities (for affine intercept sweep)
+def _svd_map_batched(X: torch.Tensor, map_fn):
+    """
+    Apply a singular-value mapping to a batch of matrices.
+    X: (..., m, n)
+    map_fn: function f(singular_vals) -> mapped_singular_vals, elementwise on last dim
+    """
+    orig_dtype = X.dtype
+    X32 = X.to(torch.float32)
+    # econ SVD: U (..., m, k), S (..., k), Vh (..., k, n)
+    U, S, Vh = torch.linalg.svd(X32, full_matrices=False)
+    S_mapped = map_fn(S)
+    US = U * S_mapped.unsqueeze(-2)
+    Y = US @ Vh
+    return Y.to(orig_dtype)
+
+def make_svd_map_affine(intercept: float, normalize: bool = True):
+    """
+    Affine family that interpolates between:
+      - intercept = 0:   normalized identity      (s_norm)
+      - intercept = 1:   normalized step mapping ((s_norm > 0) -> 1, zeros stay 0)
+
+    With normalize=True this behaves like the SVD+step map used elsewhere:
+      • we first normalize by s_max so singulars are in [0, 1]
+      • then apply a convex combination between s_norm and the step(0) map
+      • we DO NOT rescale back by s_max, so op-norm <= 1 and intercept=1 matches the
+        SVD+step behavior.
+    """
+    i = float(intercept)
+
+    def _map(s: torch.Tensor) -> torch.Tensor:
+        s = s.to(torch.float32)
+        if normalize:
+            s_max = s.amax(dim=-1, keepdim=True).clamp_min(1e-12)
+            s_norm = s / s_max
+        else:
+            s_norm = s
+        step = (s_norm > 0).to(s.dtype)
+        s_new = (1.0 - i) * s_norm + i * step
+        return s_new
+
+    return _map
+
 # medhaven: edited to avoid uint32 shifts on CUDA (bunch of errors otherwise)
 @torch.compile
 def update(acc_bf16_view_u16: Tensor, mantissa: Tensor, momentum_buffer: Tensor, grad: Tensor, momentum: Tensor, eff_lr: Tensor, eff_weight_decay: Tensor):
@@ -497,6 +541,21 @@ adam_param_groups = [dict(params=head_params, lr=1/320), dict(params=embed_param
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
 optimizer1 = torch.optim.AdamW(adam_param_groups, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0, fused=True)
+
+# Optional SVD affine mapping selection via environment. Set MAP_KIND="affine" and
+# INTERCEPT in [0.0..1.0] to apply the mapping to all hidden 2D parameters before training.
+MAP_KIND = os.environ.get("MAP_KIND", "identity").lower()
+INTERCEPT = float(os.environ.get("INTERCEPT", "1.0"))
+if MAP_KIND == "affine":
+    svd_map_fn = make_svd_map_affine(INTERCEPT, normalize=True)
+    print0(f"Applying SVD affine mapping: intercept={INTERCEPT}")
+    for p in hidden_matrix_params:
+        if p.ndim >= 2:
+            # compute mapped weight and copy in-place
+            with torch.no_grad():
+                mapped = _svd_map_batched(p.data, svd_map_fn)
+                p.data.copy_(mapped)
+
 optimizer2 = Muon(hidden_matrix_params, lr=0.025, momentum=0.95, rank=rank, world_size=world_size)
 optimizers: list[torch.optim.Optimizer] = [optimizer1, optimizer2]
 def opt_params(opt: torch.optim.Optimizer) -> list[nn.Parameter]:
