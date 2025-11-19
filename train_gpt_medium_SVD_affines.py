@@ -15,10 +15,55 @@ torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on
 from torch import Tensor, nn
 import torch.nn.functional as F
 import torch.distributed as dist
+import torch.utils.checkpoint as cp # medhaven: import checkpoint module for patching
 # use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
-torch._inductor.config.coordinate_descent_tuning = True # we allow this flag for medium track
-torch._dynamo.config.compiled_autograd = True
+torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
+torch._dynamo.config.compiled_autograd = False # medhaven: disable compiled autograd due to bugs
+
+
+# medhaven: added this to disable activation checkpointing globally
+def _no_checkpoint(function, *args, **kwargs):
+    # Drop any checkpoint-specific kwargs (like use_reentrant, debug)
+    kwargs.pop("use_reentrant", None)
+    kwargs.pop("debug", None)
+    return function(*args, **kwargs)
+
+# Patch the module-level function so anything that calls
+# torch.utils.checkpoint.checkpoint(...) will just run the function
+cp.checkpoint = _no_checkpoint
+
+# Local alias for this file if needed
+checkpoint = _no_checkpoint
+
+# We still import checkpoint_sequential just in case it’s used somewhere,
+# but we are NOT using the original checkpoint at all anymore.
+from torch.utils.checkpoint import checkpoint_sequential
+
+# medhaven:  patch checkpoint_sequential to disable checkpointing
+# ---- absolutely disable compile/inductor at runtime, belt-and-suspenders ----
+os.environ["TORCH_COMPILE_DISABLE"] = "1"
+try:
+    torch._dynamo.reset()
+except Exception:
+    pass
+
+# Stable attention backend: avoid flex/flash in DDP+BF16
+try:
+    torch.backends.cuda.enable_flash_sdp(False)
+    torch.backends.cuda.enable_mem_efficient_sdp(True)  # Triton path
+    torch.backends.cuda.enable_math_sdp(True)           # fallback ok
+except Exception:
+    pass
+
+# fixing all types
+torch.set_float32_matmul_precision("high")  # or "medium" if you want
+# If you’re training in bf16, keep autocast; otherwise comment:
+amp_dtype = torch.bfloat16
+# You can also switch to float16 if you aren’t using bf16 everywhere:
+# amp_dtype = torch.float16
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # -----------------------------------------------------------------------------
 # Muon optimizer
@@ -56,18 +101,32 @@ def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
         X = X.mT
     return X
 
+# medhaven: edited to avoid uint32 shifts on CUDA (bunch of errors otherwise)
 @torch.compile
 def update(acc_bf16_view_u16: Tensor, mantissa: Tensor, momentum_buffer: Tensor, grad: Tensor, momentum: Tensor, eff_lr: Tensor, eff_weight_decay: Tensor):
     assert acc_bf16_view_u16.dtype == mantissa.dtype == torch.uint16
     grad = grad.float()
     momentum_buffer.copy_(momentum * momentum_buffer + (1 - momentum) * grad)
     v = zeropower_via_newtonschulz5(momentum * momentum_buffer + (1 - momentum) * grad)
+    # medhaven: modified below to avoid uint32 shifts on CUDA
+    # acc_m_u32 = (acc_bf16_view_u16.to(torch.uint32) << 16) | mantissa.to(torch.uint32)
+    # Do bit-twiddling in int32 because uint32 << is not implemented on CUDA
+    acc_m_i32 = (acc_bf16_view_u16.to(torch.int32) << 16) | mantissa.to(torch.int32)
+    acc_m_u32 = acc_m_i32.to(torch.uint32)
 
-    acc_m_u32 = (acc_bf16_view_u16.to(torch.uint32) << 16) | mantissa.to(torch.uint32)
     acc_m_u32.view(torch.float32).mul_(1 - eff_weight_decay)
     acc_m_u32.view(torch.float32).add_(other=v, alpha=-eff_lr)
-    acc_bf16_view_u16.copy_((acc_m_u32 >> 16).to(torch.uint16))
-    mantissa.copy_(acc_m_u32.to(torch.uint16))
+
+    # medhaven: modified below to avoid uint32 shifts on CUDA
+    # acc_bf16_view_u16.copy_((acc_m_u32 >> 16).to(torch.uint16))
+    acc_m_i32 = acc_m_u32.to(torch.int32)
+    upper16 = (acc_m_i32 >> 16).to(torch.uint16)  # high 16 bits
+    lower16 = acc_m_i32.to(torch.uint16)    
+
+    # medhaven
+    # mantissa.copy_(acc_m_u32.to(torch.uint16))
+    acc_bf16_view_u16.copy_(upper16)
+    mantissa.copy_(lower16)
 
 class Muon(torch.optim.Optimizer):
     """
@@ -268,7 +327,9 @@ class GPT(nn.Module):
             )
         # Long-short SWA block masks by @leloykun & @YouJiacheng, adapated from suggestion by @Grad62304977, following Gemma 2 paper
         return build_bm(sliding_window_num_blocks), build_bm(sliding_window_num_blocks // 2)
-
+    
+    # medhaven: FIX THIS SECTION IF THERE IS AN ERROR
+    # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     def forward(self, input_seq: Tensor, target_seq: Tensor, sliding_window_num_blocks: Tensor):
         assert input_seq.ndim == 1
 
@@ -349,8 +410,8 @@ class Hyperparameters:
     train_files = "data/fineweb10B/fineweb_train_*.bin" # input .bin to train on
     val_files = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
     val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
-    train_seq_len = 64*1024 # FlexAttention sequence length
-    val_seq_len = 4*64*1024 # FlexAttention sequence length for validation
+    train_seq_len = 4096 # before: 64*1024 # FlexAttention sequence length
+    val_seq_len = 4096 # before: 4*64*1024 # FlexAttention sequence length for validation
     # optimization
     num_iterations = 5960 # number of iterations to run
     cooldown_frac = 0.7 # fraction of training spent cooling down the learning rate
@@ -365,7 +426,8 @@ run_id = int(os.environ.get("RUN_ID", 0))
 # torchrun sets these env variables
 rank = int(os.environ["RANK"])
 world_size = int(os.environ["WORLD_SIZE"])
-assert world_size == 8 # this code is designed for 8xH100
+# medhaven: removed 
+# assert world_size == 8 # this code is designed for 8xH100
 assert torch.cuda.is_available()
 device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
@@ -462,18 +524,30 @@ def get_window_size_blocks(step: int):
     assert 0 <= x <= 1
     # Linearly increase the block-wise sliding window size over training 128 -> 1792
     # increase by @fernbear.bsky.social; block-wise by @YouJiacheng
-    factor = 4 * x ** 3 - 6 * x ** 2 + 3 * x # cubic schedule by @jadenj3o
+    factor = 4 * x ** 3 - 6 * x ** 2 + 3 * x
     window_size = next_multiple_of_n(3456 * factor, n=128)
     return get_window_size_blocks_helper(window_size)
 
-model: nn.Module = torch.compile(model, dynamic=False)
+# medhaven: replaced the following line with the maybe_compile function below for debugging stuff
+# model: nn.Module = torch.compile(model, dynamic=False)
+
+# Safe, opt-in compile (defaults OFF). Turn on only after things are stable.
+def maybe_compile(m: nn.Module):
+    if os.environ.get("TORCH_COMPILE_DISABLE", "1") != "1":
+        try:
+            return torch.compile(m, dynamic=False)
+        except Exception:
+            pass
+    return m
+
+model = maybe_compile(model)
 
 ########################################
 #            Warmup kernels            #
 ########################################
 
 # Warmup the training kernels, then re-initialize the state so we aren't cheating
-warmup_steps = 10
+warmup_steps = 0 # medhaven: set to 0 to skip warmup (was originally 10)
 initial_state = copy.deepcopy(dict(model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers]))
 for _ in range(warmup_steps):
     inputs = targets = torch.randint(0, args.vocab_size, size=(args.train_seq_len,), device="cuda")

@@ -452,7 +452,7 @@ import torch._inductor.codecache # noqa: E402
 import torch._inductor.graph # noqa: E402
 def _patched_trace_structured(name, metadata_fn, **kwargs):
     if name == "inductor_output_code":
-        print0(f"inductor_output_code: {metadata_fn().get('filename', 'Unknown')}")
+        print0(f"inductor_output_code: {metadata_fn().get("filename", "Unknown")}")
     trace_structured(name, metadata_fn, **kwargs)
 torch._inductor.codecache.trace_structured = _patched_trace_structured
 torch._inductor.graph.trace_structured = _patched_trace_structured
@@ -497,29 +497,11 @@ adam_param_groups = [dict(params=head_params, lr=1/320), dict(params=embed_param
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
 optimizer1 = torch.optim.AdamW(adam_param_groups, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0, fused=True)
-
-# Choose which optimizer to use for the hidden (matrix) parameters. This enables easy
-# comparisons between Muon, SGD, and Adam on the same model. Set the environment
-# variable `HIDDEN_OPTIM` to one of: "muon", "sgd", or "adam" (default: "muon").
-hidden_optim = os.environ.get("HIDDEN_OPTIM", "muon").lower()
-if hidden_optim == "muon":
-    optimizer2 = Muon(hidden_matrix_params, lr=0.025, momentum=0.95, rank=rank, world_size=world_size)
-elif hidden_optim == "sgd":
-    # SGD with momentum; do not apply weight decay here so it matches Muon's behavior
-    optimizer2 = torch.optim.SGD([dict(params=hidden_matrix_params, lr=0.025, momentum=0.95, weight_decay=0.0)])
-elif hidden_optim == "adam":
-    # AdamW for the hidden matrices. Use similar betas/eps to the head Adam above.
-    optimizer2 = torch.optim.AdamW([dict(params=hidden_matrix_params, lr=0.02)], betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0)
-else:
-    raise ValueError(f"Unknown HIDDEN_OPTIM '{hidden_optim}'; choose 'muon', 'sgd', or 'adam'.")
-
+optimizer2 = Muon(hidden_matrix_params, lr=0.025, momentum=0.95, rank=rank, world_size=world_size)
 optimizers: list[torch.optim.Optimizer] = [optimizer1, optimizer2]
-
 def opt_params(opt: torch.optim.Optimizer) -> list[nn.Parameter]:
     return [p for group in opt.param_groups for p in group["params"]]
-
 opt2params = {opt: opt_params(opt) for opt in optimizers}
-print0(f"Hidden optimizer selected: {hidden_optim}")
 for opt in optimizers:
     for group in opt.param_groups:
         group["initial_lr"] = group["lr"]
@@ -638,12 +620,9 @@ for step in range(train_steps + 1):
     for opt in optimizers:
         for group in opt.param_groups:
             group["lr"] = group["initial_lr"] * get_lr(step)
-    # momentum warmup: only apply when the hidden optimizer supports momentum (Muon or SGD)
-    if hidden_optim in ("muon", "sgd"):
-        for group in optimizer2.param_groups:
-            if "momentum" in group:
-                frac = min(step / 300, 1)
-                group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
+    for group in optimizer2.param_groups:
+        frac = min(step / 300, 1) # momentum warmup for muon
+        group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
     # step the optimizers
     for opt in optimizers:
         torch.futures.collect_all(opt2futures[opt]).wait()

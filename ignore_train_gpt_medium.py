@@ -1,7 +1,7 @@
 import os
 import sys
 with open(sys.argv[0]) as f:
-    code = f.read() # read the code of this file ASAP, for logging
+    code = f.read()
 import uuid
 import time
 import copy
@@ -11,18 +11,18 @@ from pathlib import Path
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
-torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on some systems
+torch.empty(1, device="cuda", requires_grad=True).backward()
 from torch import Tensor, nn
 import torch.nn.functional as F
 import torch.distributed as dist
-import torch.utils.checkpoint as cp # medhaven: import checkpoint module for patching
-# use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
-torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
-torch._dynamo.config.compiled_autograd = False # medhaven: disable compiled autograd due to bugs
+torch._inductor.config.coordinate_descent_tuning = True
+# 🔴 TURN THIS OFF (we'll fix below)
+torch._dynamo.config.compiled_autograd = False
+import torch
+import torch.utils.checkpoint as cp
 
-
-# medhaven: added this to disable activation checkpointing globally
+# ---- Global monkeypatch: disable activation checkpointing everywhere ----
 def _no_checkpoint(function, *args, **kwargs):
     # Drop any checkpoint-specific kwargs (like use_reentrant, debug)
     kwargs.pop("use_reentrant", None)
@@ -40,7 +40,8 @@ checkpoint = _no_checkpoint
 # but we are NOT using the original checkpoint at all anymore.
 from torch.utils.checkpoint import checkpoint_sequential
 
-# medhaven:  patch checkpoint_sequential to disable checkpointing
+
+
 # ---- absolutely disable compile/inductor at runtime, belt-and-suspenders ----
 os.environ["TORCH_COMPILE_DISABLE"] = "1"
 try:
@@ -48,7 +49,7 @@ try:
 except Exception:
     pass
 
-# Stable attention backend: avoid flex/flash in DDP+BF16
+# ---- Stable attention backend: avoid flex/flash in DDP+BF16 ----
 try:
     torch.backends.cuda.enable_flash_sdp(False)
     torch.backends.cuda.enable_mem_efficient_sdp(True)  # Triton path
@@ -56,7 +57,7 @@ try:
 except Exception:
     pass
 
-# fixing all types
+# ---- Matmul / dtype sanity for H100 ----
 torch.set_float32_matmul_precision("high")  # or "medium" if you want
 # If you’re training in bf16, keep autocast; otherwise comment:
 amp_dtype = torch.bfloat16
@@ -64,6 +65,7 @@ amp_dtype = torch.bfloat16
 # amp_dtype = torch.float16
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
 # -----------------------------------------------------------------------------
 # Muon optimizer
@@ -101,7 +103,6 @@ def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
         X = X.mT
     return X
 
-# medhaven: edited to avoid uint32 shifts on CUDA (bunch of errors otherwise)
 @torch.compile
 def update(acc_bf16_view_u16: Tensor, mantissa: Tensor, momentum_buffer: Tensor, grad: Tensor, momentum: Tensor, eff_lr: Tensor, eff_weight_decay: Tensor):
     assert acc_bf16_view_u16.dtype == mantissa.dtype == torch.uint16
@@ -123,7 +124,7 @@ def update(acc_bf16_view_u16: Tensor, mantissa: Tensor, momentum_buffer: Tensor,
     upper16 = (acc_m_i32 >> 16).to(torch.uint16)  # high 16 bits
     lower16 = acc_m_i32.to(torch.uint16)    
 
-    # medhaven
+    # medhaven: original lines commented out
     # mantissa.copy_(acc_m_u32.to(torch.uint16))
     acc_bf16_view_u16.copy_(upper16)
     mantissa.copy_(lower16)
@@ -327,49 +328,98 @@ class GPT(nn.Module):
             )
         # Long-short SWA block masks by @leloykun & @YouJiacheng, adapated from suggestion by @Grad62304977, following Gemma 2 paper
         return build_bm(sliding_window_num_blocks), build_bm(sliding_window_num_blocks // 2)
-    
-    # medhaven: FIX THIS SECTION IF THERE IS AN ERROR
-    # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+        
     def forward(self, input_seq: Tensor, target_seq: Tensor, sliding_window_num_blocks: Tensor):
         assert input_seq.ndim == 1
 
+        # ----- value embeddings (keep as-is) -----
         ve = [value_embed(input_seq) for value_embed in self.value_embeds]
         # 012 ... 012 structure on token value embeddings by @YouJiacheng, improved on @leloykun's U-net structure
         ve = [ve[0], ve[1], ve[2]] + [None] * (len(self.blocks) - 6) + [ve[0], ve[1], ve[2]]
         assert len(ve) == len(self.blocks)
 
+        # ----- block masks (keep as-is / tuned to your layout) -----
         long_bm, short_bm = self.create_blockmasks(input_seq, sliding_window_num_blocks)
-        block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, short_bm, short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, short_bm, long_bm]
+        block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, short_bm,
+                    short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, short_bm, long_bm]
         assert len(block_masks) == len(self.blocks)
 
-        x = x0 = norm(self.embed(input_seq)[None]) # use of norm here by @Grad62304977
+        # ----- embeddings + first norm -----
+        x = x0 = norm(self.embed(input_seq)[None])  # [1, T, D]
 
+        # ----- skip setup (unchanged) -----
         skip_connections = []
-        skip_map = {
-            9: 6,
-            10: 4,
-            11: 2,
-        }
+        skip_map = {9: 6, 10: 4, 11: 2}
         skip_weights = self.scalars[:len(self.blocks)]
         lambdas = self.scalars[1 * len(self.blocks): 3 * len(self.blocks)].view(-1, 2)
         sa_lambdas = self.scalars[3 * len(self.blocks): 5 * len(self.blocks)].view(-1, 2)
-        for i in range(len(self.blocks)):
-            if i in skip_map:
-                x = x + skip_weights[skip_map[i]] * skip_connections[skip_map[i]]
-            x = self.blocks[i](x, ve[i], x0, block_masks[i], lambdas[i], sa_lambdas[i])
-            skip_connections.append(x)
 
-        x = norm(x)
+        # ----- AMP on forward to cut activation memory -----
+        use_amp = x.is_cuda
+        amp_dtype = torch.bfloat16
+
+        with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
+            # ----- transformer stack with per-block checkpoint when training -----
+            for i in range(len(self.blocks)):
+                if i in skip_map:
+                    x = x + skip_weights[skip_map[i]] * skip_connections[skip_map[i]]
+
+                blk = self.blocks[i]
+                ve_i = ve[i]
+                bm_i = block_masks[i]
+                lam_i = lambdas[i]
+                sa_lam_i = sa_lambdas[i]
+
+                if self.training:
+                    # Checkpoint this block to save activations.
+                    # use_reentrant=False is safer with AMP/bf16.
+                    x = torch.utils.checkpoint.checkpoint(
+                        lambda t: blk(t, ve_i, x0, bm_i, lam_i, sa_lam_i),
+                        x,
+                        use_reentrant=False
+                    )
+                else:
+                    x = blk(x, ve_i, x0, bm_i, lam_i, sa_lam_i)
+
+                skip_connections.append(x)
+
+            # ----- final norm -----
+            x = norm(x)
+
+        # ----- helper: chunked CE to avoid logits memory spikes -----
+        def _chunked_ce_from_hidden(x_bt_d: Tensor, targets_bt: Tensor, chunk: int = 8192) -> Tensor:
+            # x_bt_d: [B*T, D], targets_bt: [B*T]
+            total_loss = 0.0
+            total_count = 0
+            # project in chunks to reduce peak (vocab matmul is the big one)
+            for s in range(0, x_bt_d.size(0), chunk):
+                e = min(s + chunk, x_bt_d.size(0))
+                # projection in AMP, cast logits to fp32 for CE stability
+                logits = F.linear(x_bt_d[s:e], self.lm_head_w.to(x_bt_d.dtype)).float()
+                # same nonlinearity you had: 15 * logits / sqrt(logits^2 + 225)
+                logits = 15.0 * logits * torch.rsqrt(logits.square() + 225.0)
+                # accumulate sum to get exact mean later
+                total_loss += F.cross_entropy(logits, targets_bt[s:e], reduction="sum")
+                total_count += (e - s)
+            return total_loss / max(1, total_count)
+
+        # ----- training loss (chunked) -----
         if self.training:
-            logits: Tensor = F.linear(x.flatten(end_dim=1), self.lm_head_w.bfloat16()).float()
-            loss = F.cross_entropy(15 * logits * torch.rsqrt(logits.square() + 225), target_seq)
-            return loss
+            x2d = x.flatten(end_dim=1).contiguous()        # [B*T, D]
+            tgt = target_seq.contiguous()                  # [B*T]
+            return _chunked_ce_from_hidden(x2d, tgt)
 
-        loss = 0
+        # ----- eval loss (keep your 4-way chunking; also safe on memory) -----
+        loss = 0.0
+        x_chunks = x.flatten(end_dim=1).contiguous().chunk(4)
+        t_chunks = target_seq.contiguous().chunk(4)
         for i in range(4):
-            logits: Tensor = F.linear(x.flatten(end_dim=1).chunk(4)[i], self.lm_head_w.bfloat16()).float()
-            loss += F.cross_entropy(15 * logits * torch.rsqrt(logits.square() + 225), target_seq.chunk(4)[i]) / 4
+            logits = F.linear(x_chunks[i], self.lm_head_w.to(x_chunks[i].dtype)).float()
+            logits = 15.0 * logits * torch.rsqrt(logits.square() + 225.0)
+            loss += F.cross_entropy(logits, t_chunks[i]) / 4.0
         return loss
+
 
 # -----------------------------------------------------------------------------
 # Our own simple Distributed Data Loader
@@ -426,8 +476,7 @@ run_id = int(os.environ.get("RUN_ID", 0))
 # torchrun sets these env variables
 rank = int(os.environ["RANK"])
 world_size = int(os.environ["WORLD_SIZE"])
-# medhaven: removed 
-# assert world_size == 8 # this code is designed for 8xH100
+# assert world_size == 8 # this code is designed for 8xH100 #medhaven: commented out
 assert torch.cuda.is_available()
 device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
@@ -452,7 +501,7 @@ import torch._inductor.codecache # noqa: E402
 import torch._inductor.graph # noqa: E402
 def _patched_trace_structured(name, metadata_fn, **kwargs):
     if name == "inductor_output_code":
-        print0(f"inductor_output_code: {metadata_fn().get('filename', 'Unknown')}")
+        print0(f"inductor_output_code: {metadata_fn().get("filename", "Unknown")}")
     trace_structured(name, metadata_fn, **kwargs)
 torch._inductor.codecache.trace_structured = _patched_trace_structured
 torch._inductor.graph.trace_structured = _patched_trace_structured
@@ -473,19 +522,41 @@ print0("="*100)
 #    Construct model and optimizer     #
 ########################################
 
-model: nn.Module = GPT(vocab_size=args.vocab_size, num_layers=16, num_heads=8, model_dim=1024,
-                       max_seq_len=max(args.train_seq_len, args.val_seq_len)).cuda()
+model: nn.Module = GPT(
+    vocab_size=args.vocab_size,
+    num_layers=16,
+    num_heads=8,
+    model_dim=1024,
+    max_seq_len=max(args.train_seq_len, args.val_seq_len),
+).cuda()
+
+# Enable grad checkpointing if the model supports it (HuggingFace-style API)
+# medhaven: commented out
+# if hasattr(model, "gradient_checkpointing_enable"):
+#     model.gradient_checkpointing_enable()
+
+
+
+# cast embeddings to bf16
 for m in model.modules():
     if isinstance(m, nn.Embedding):
         m.bfloat16()
+
+
+# sync initial weights
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
 # collect the parameters to optimize
-hidden_matrix_params = sorted((p for p in model.blocks.parameters() if p.ndim >= 2), key=lambda x: x.size(), reverse=True)
+hidden_matrix_params = sorted(
+    (p for p in model.blocks.parameters() if p.ndim >= 2),
+    key=lambda x: x.size(),
+    reverse=True,
+)
 embed_params = [*model.embed.parameters(), *model.value_embeds.parameters()]
 scalar_params = [model.scalars]
 head_params: list[nn.Parameter] = [model.lm_head_w]
+
 # sanity check
 params_collections = [hidden_matrix_params, embed_params, scalar_params, head_params]
 optimized_parameters_set = {p for params in params_collections for p in params}
@@ -493,40 +564,27 @@ assert optimized_parameters_set == {*model.parameters()}
 assert len(optimized_parameters_set) == sum(len(lst) for lst in params_collections)
 
 # init the optimizer(s)
-adam_param_groups = [dict(params=head_params, lr=1/320), dict(params=embed_params, lr=0.3), dict(params=scalar_params, lr=0.015)]
-# small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
-# discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
-optimizer1 = torch.optim.AdamW(adam_param_groups, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0, fused=True)
-
-# Choose which optimizer to use for the hidden (matrix) parameters. This enables easy
-# comparisons between Muon, SGD, and Adam on the same model. Set the environment
-# variable `HIDDEN_OPTIM` to one of: "muon", "sgd", or "adam" (default: "muon").
-hidden_optim = os.environ.get("HIDDEN_OPTIM", "muon").lower()
-if hidden_optim == "muon":
-    optimizer2 = Muon(hidden_matrix_params, lr=0.025, momentum=0.95, rank=rank, world_size=world_size)
-elif hidden_optim == "sgd":
-    # SGD with momentum; do not apply weight decay here so it matches Muon's behavior
-    optimizer2 = torch.optim.SGD([dict(params=hidden_matrix_params, lr=0.025, momentum=0.95, weight_decay=0.0)])
-elif hidden_optim == "adam":
-    # AdamW for the hidden matrices. Use similar betas/eps to the head Adam above.
-    optimizer2 = torch.optim.AdamW([dict(params=hidden_matrix_params, lr=0.02)], betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0)
-else:
-    raise ValueError(f"Unknown HIDDEN_OPTIM '{hidden_optim}'; choose 'muon', 'sgd', or 'adam'.")
-
+adam_param_groups = [
+    dict(params=head_params, lr=1 / 320),
+    dict(params=embed_params, lr=0.3),
+    dict(params=scalar_params, lr=0.015),
+]
+optimizer1 = torch.optim.AdamW(
+    adam_param_groups, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0, fused=True
+)
+optimizer2 = Muon(hidden_matrix_params, lr=0.025, momentum=0.95, rank=rank, world_size=world_size)
 optimizers: list[torch.optim.Optimizer] = [optimizer1, optimizer2]
 
 def opt_params(opt: torch.optim.Optimizer) -> list[nn.Parameter]:
     return [p for group in opt.param_groups for p in group["params"]]
-
 opt2params = {opt: opt_params(opt) for opt in optimizers}
-print0(f"Hidden optimizer selected: {hidden_optim}")
 for opt in optimizers:
     for group in opt.param_groups:
         group["initial_lr"] = group["lr"]
 
 # learning rate schedule: stable then decay
 def get_lr(step: int):
-    x = step / args.num_iterations # progress in training
+    x = step / args.num_iterations  # progress in training
     assert 0 <= x < 1
     if x < 1 - args.cooldown_frac:
         return 1.0
@@ -537,17 +595,16 @@ def get_lr(step: int):
 @lru_cache(1)
 def get_window_size_blocks_helper(window_size: int):
     return torch.tensor(window_size // 128, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+
 def get_window_size_blocks(step: int):
-    x = step / args.num_iterations # progress in training
+    x = step / args.num_iterations  # progress in training
     assert 0 <= x <= 1
     # Linearly increase the block-wise sliding window size over training 128 -> 1792
     # increase by @fernbear.bsky.social; block-wise by @YouJiacheng
-    factor = 4 * x ** 3 - 6 * x ** 2 + 3 * x
+    factor = 4 * x ** 3 - 6 * x ** 2 + 3 * x  # cubic schedule by @jadenj3o
     window_size = next_multiple_of_n(3456 * factor, n=128)
     return get_window_size_blocks_helper(window_size)
 
-# medhaven: replaced the following line with the maybe_compile function below for debugging stuff
-# model: nn.Module = torch.compile(model, dynamic=False)
 
 # Safe, opt-in compile (defaults OFF). Turn on only after things are stable.
 def maybe_compile(m: nn.Module):
@@ -565,7 +622,7 @@ model = maybe_compile(model)
 ########################################
 
 # Warmup the training kernels, then re-initialize the state so we aren't cheating
-warmup_steps = 0 # medhaven: set to 0 to skip warmup (was originally 10)
+warmup_steps = 0 # medhaven: set to 0 to skip warmup from 10
 initial_state = copy.deepcopy(dict(model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers]))
 for _ in range(warmup_steps):
     inputs = targets = torch.randint(0, args.vocab_size, size=(args.train_seq_len,), device="cuda")
@@ -638,12 +695,9 @@ for step in range(train_steps + 1):
     for opt in optimizers:
         for group in opt.param_groups:
             group["lr"] = group["initial_lr"] * get_lr(step)
-    # momentum warmup: only apply when the hidden optimizer supports momentum (Muon or SGD)
-    if hidden_optim in ("muon", "sgd"):
-        for group in optimizer2.param_groups:
-            if "momentum" in group:
-                frac = min(step / 300, 1)
-                group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
+    for group in optimizer2.param_groups:
+        frac = min(step / 300, 1) # momentum warmup for muon
+        group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
     # step the optimizers
     for opt in optimizers:
         torch.futures.collect_all(opt2futures[opt]).wait()
