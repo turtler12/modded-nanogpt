@@ -145,6 +145,27 @@ def make_svd_map_affine(intercept: float, normalize: bool = True):
 
     return _map
 
+
+def make_svd_map_affine_no_norm(intercept: float):
+    """
+    Affine mapping without spectral normalization. Interpolates singular values
+    between the original s and s_max (per-matrix largest singular value).
+
+    For intercept=0: returns s (identity).
+    For intercept=1: returns s_max * ones_like(s) (i.e., U (s_max * I) V^T).
+    """
+    i = float(intercept)
+
+    def _map(s: torch.Tensor) -> torch.Tensor:
+        s = s.to(torch.float32)
+        s_max = s.amax(dim=-1, keepdim=True).clamp_min(0.0)
+        step = (s > 0).to(s.dtype)
+        # convex combination between original s and s_max (for positive singulars)
+        s_new = (1.0 - i) * s + i * (s_max * step)
+        return s_new
+
+    return _map
+
 # medhaven: edited to avoid uint32 shifts on CUDA (bunch of errors otherwise)
 @torch.compile
 def update(acc_bf16_view_u16: Tensor, mantissa: Tensor, momentum_buffer: Tensor, grad: Tensor, momentum: Tensor, eff_lr: Tensor, eff_weight_decay: Tensor):
@@ -186,12 +207,14 @@ class Muon(torch.optim.Optimizer):
     Warning: This optimizer should not be used for the embedding layer, the final fully connected layer,
     or any {0,1}-D parameters; those should all be optimized by a standard method (e.g., AdamW).
     """
-    def __init__(self, params, lr=0.02, weight_decay=0.01, momentum=0.95, rank=0, world_size=1):
+    def __init__(self, params, lr=0.02, weight_decay=0.01, momentum=0.95, rank=0, world_size=1, use_svd_mapping: bool = False, svd_map_fn=None):
         self.rank = rank
         self.world_size = world_size
         defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum)
         super().__init__(params, defaults)
         assert all(p.dtype == torch.bfloat16 for group in self.param_groups for p in group["params"])
+        self.use_svd_mapping = use_svd_mapping
+        self.svd_map_fn = svd_map_fn
 
     @torch.no_grad()
     def step(self):
@@ -200,21 +223,62 @@ class Muon(torch.optim.Optimizer):
             params: list[Tensor] = group["params"]
             params_pad = params + [torch.empty_like(params[-1])] * self.world_size
             momentum = torch._as_tensor_fullprec(group["momentum"])
+
             for base_i in range(len(params))[::self.world_size]:
-                if base_i + self.rank < len(params):
-                    p = params[base_i + self.rank]
-                    state = self.state[p]
-                    if len(state) == 0:
-                        state["mantissa"] = torch.zeros_like(p, dtype=torch.uint16)
-                        state["momentum_buffer"] = torch.zeros_like(p, dtype=torch.float32)
+                if base_i + self.rank >= len(params):
+                    # still need to enqueue a gather for padding alignment
+                    futures.append(
+                        dist.all_gather(params_pad[base_i:base_i + self.world_size],
+                                        params_pad[base_i + self.rank],
+                                        async_op=True).get_future()
+                    )
+                    continue
+
+                p = params[base_i + self.rank]
+                state = self.state[p]
+                if len(state) == 0:
+                    state["mantissa"] = torch.zeros_like(p, dtype=torch.uint16)   # used by NS path
+                    state["momentum_buffer"] = torch.zeros_like(p, dtype=torch.float32)
+
+                mbuf: torch.Tensor = state["momentum_buffer"]
+                g32 = p.grad.float()
+
+                # momentum buffer update (same in both paths)
+                mbuf.copy_(momentum * mbuf + (1 - momentum) * g32)
+
+                eff_lr = torch._as_tensor_fullprec(group["lr"] * max(1, p.size(-2) / p.size(-1)) ** 0.5)
+                eff_wd = torch._as_tensor_fullprec(group["lr"] * group["weight_decay"] * getattr(p, "wd_mul", 1.0))
+
+                if self.use_svd_mapping and p.ndim >= 2 and self.svd_map_fn is not None:
+                    # ------------ MAPPING-ONLY PATH (NO NS) ------------
+                    # same pre-update as earlier experiments
+                    upd32 = momentum * mbuf + (1 - momentum) * g32
+
+                    # SVD → map (Yes-SN or No-SN) → recompose
+                    v = _svd_map_batched(upd32, self.svd_map_fn).to(p.dtype)
+
+                    # weight decay then SGD step
+                    p.mul_(1 - eff_wd)
+                    p.add_(v, alpha=-eff_lr.item())
+
+                else:
+                    # ------------ NS-ONLY PATH ------------
                     update(
                         p.view(torch.uint16), state["mantissa"], state["momentum_buffer"],
                         p.grad, momentum,
-                        eff_lr=torch._as_tensor_fullprec(group["lr"] * max(1, p.size(-2) / p.size(-1)) ** 0.5),
-                        eff_weight_decay=torch._as_tensor_fullprec(group["lr"] * group["weight_decay"] * getattr(p, "wd_mul", 1.0)),
+                        eff_lr=eff_lr,
+                        eff_weight_decay=eff_wd,
                     )
-                futures.append(dist.all_gather(params_pad[base_i:base_i + self.world_size], params_pad[base_i + self.rank], async_op=True).get_future())
+
+                # schedule the all_gather for this stride-chunk
+                futures.append(
+                    dist.all_gather(params_pad[base_i:base_i + self.world_size],
+                                    params_pad[base_i + self.rank],
+                                    async_op=True).get_future()
+                )
+
         torch.futures.collect_all(futures).wait()
+
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the model
@@ -496,7 +560,7 @@ import torch._inductor.codecache # noqa: E402
 import torch._inductor.graph # noqa: E402
 def _patched_trace_structured(name, metadata_fn, **kwargs):
     if name == "inductor_output_code":
-        print0(f"inductor_output_code: {metadata_fn().get("filename", "Unknown")}")
+        print0(f"inductor_output_code: {metadata_fn().get('filename', 'Unknown')}")
     trace_structured(name, metadata_fn, **kwargs)
 torch._inductor.codecache.trace_structured = _patched_trace_structured
 torch._inductor.graph.trace_structured = _patched_trace_structured
@@ -527,6 +591,29 @@ for param in model.parameters():
 
 # collect the parameters to optimize
 hidden_matrix_params = sorted((p for p in model.blocks.parameters() if p.ndim >= 2), key=lambda x: x.size(), reverse=True)
+
+# --- Mapping controls (replicate Yes-SN / No-SN from previous model) ---
+MAP_KIND       = os.environ.get("MAP_KIND", "identity").lower()   # "affine" to activate mapping
+INTERCEPT      = float(os.environ.get("INTERCEPT", "1.0"))        # 0..1
+MAP_NORMALIZE  = int(os.environ.get("MAP_NORMALIZE", "1"))        # 1 => Yes-SN, 0 => No-SN
+APPLY_INIT_MAP = int(os.environ.get("APPLY_INIT_MAP", "0"))       # default 0 to avoid confound
+
+svd_map_fn_selected = None
+if MAP_KIND == "affine":
+    # Yes-SN = normalize=True, No-SN = normalize=False
+    svd_map_fn_selected = make_svd_map_affine(INTERCEPT, normalize=bool(MAP_NORMALIZE))
+
+# --- Optional: one-shot SVD map on initial hidden weights (disabled by default) ---
+if svd_map_fn_selected is not None and APPLY_INIT_MAP:
+    print0(f"[INIT MAP] intercept={INTERCEPT}, normalize={MAP_NORMALIZE}")
+    with torch.no_grad():
+        for p in hidden_matrix_params:
+            if p.ndim >= 2:
+                p.copy_(_svd_map_batched(p, svd_map_fn_selected))
+
+
+
+
 embed_params = [*model.embed.parameters(), *model.value_embeds.parameters()]
 scalar_params = [model.scalars]
 head_params: list[nn.Parameter] = [model.lm_head_w]
@@ -536,6 +623,8 @@ optimized_parameters_set = {p for params in params_collections for p in params}
 assert optimized_parameters_set == {*model.parameters()}
 assert len(optimized_parameters_set) == sum(len(lst) for lst in params_collections)
 
+
+
 # init the optimizer(s)
 adam_param_groups = [dict(params=head_params, lr=1/320), dict(params=embed_params, lr=0.3), dict(params=scalar_params, lr=0.015)]
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
@@ -544,19 +633,29 @@ optimizer1 = torch.optim.AdamW(adam_param_groups, betas=(0.8, 0.95), eps=1e-10, 
 
 # Optional SVD affine mapping selection via environment. Set MAP_KIND="affine" and
 # INTERCEPT in [0.0..1.0] to apply the mapping to all hidden 2D parameters before training.
-MAP_KIND = os.environ.get("MAP_KIND", "identity").lower()
-INTERCEPT = float(os.environ.get("INTERCEPT", "1.0"))
-if MAP_KIND == "affine":
-    svd_map_fn = make_svd_map_affine(INTERCEPT, normalize=True)
-    print0(f"Applying SVD affine mapping: intercept={INTERCEPT}")
-    for p in hidden_matrix_params:
-        if p.ndim >= 2:
-            # compute mapped weight and copy in-place
-            with torch.no_grad():
-                mapped = _svd_map_batched(p.data, svd_map_fn)
-                p.data.copy_(mapped)
+# MAP_KIND = os.environ.get("MAP_KIND", "identity").lower()
+# INTERCEPT = float(os.environ.get("INTERCEPT", "1.0"))
+# if MAP_KIND == "affine":
+#     svd_map_fn = make_svd_map_affine_no_norm(INTERCEPT)
+#     print0(f"Applying SVD affine mapping (no-norm): intercept={INTERCEPT}")
+#     for p in hidden_matrix_params:
+#         if p.ndim >= 2:
+#             # compute mapped weight and copy in-place
+#             with torch.no_grad():
+#                 mapped = _svd_map_batched(p.data, svd_map_fn)
+#                 p.data.copy_(mapped)
 
-optimizer2 = Muon(hidden_matrix_params, lr=0.025, momentum=0.95, rank=rank, world_size=world_size)
+
+
+# medhaven: modified to pass svd_map_fn_selected to Muon optimizer
+# optimizer2 = Muon(hidden_matrix_params, lr=0.025, momentum=0.95, rank=rank, world_size=world_size)
+optimizer2 = Muon(
+    hidden_matrix_params,
+    lr=0.025, momentum=0.95, rank=rank, world_size=world_size,
+    use_svd_mapping=(svd_map_fn_selected is not None),
+    svd_map_fn=svd_map_fn_selected,
+)
+
 optimizers: list[torch.optim.Optimizer] = [optimizer1, optimizer2]
 def opt_params(opt: torch.optim.Optimizer) -> list[nn.Parameter]:
     return [p for group in opt.param_groups for p in group["params"]]
