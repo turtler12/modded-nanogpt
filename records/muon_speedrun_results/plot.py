@@ -24,16 +24,25 @@ mpl.rcParams.update({
     "axes.spines.right": False,
 })
 
-LOG_PATTERN = re.compile(r'^step:(\d+)/\d+\s+val_loss:([0-9.]+)\s+train_time:([0-9.]+)s')
+# Baselines log time in seconds: train_time:477.705s
+# Our runs log time in milliseconds: train_time:323655ms
+LOG_PATTERN_S  = re.compile(r'^step:(\d+)/\d+\s+val_loss:([0-9.]+)\s+train_time:([0-9.]+)s\b')
+LOG_PATTERN_MS = re.compile(r'^step:(\d+)/\d+\s+val_loss:([0-9.]+)\s+train_time:([0-9.]+)ms\b')
 
 def parse_log(path):
     steps, losses, times = [], [], []
     for line in Path(path).read_text().splitlines():
-        m = LOG_PATTERN.match(line)
+        m = LOG_PATTERN_S.match(line)
         if m:
             steps.append(int(m.group(1)))
             losses.append(float(m.group(2)))
-            times.append(float(m.group(3)))
+            times.append(float(m.group(3)))          # already seconds
+            continue
+        m = LOG_PATTERN_MS.match(line)
+        if m:
+            steps.append(int(m.group(1)))
+            losses.append(float(m.group(2)))
+            times.append(float(m.group(3)) / 1000.0)  # ms → seconds
     return steps, losses, times
 
 def smooth(losses, k=1):
@@ -54,7 +63,16 @@ baselines = {
     "ContraNorMuon (3225 steps, SOTA)": HERE / "sota_baseline/contra_muon_sota.txt",
 }
 
-my_runs = sorted((HERE / "runs").glob("**/*.txt")) if (HERE / "runs").exists() else []
+runs_dir = HERE / "runs"
+all_runs = sorted(runs_dir.glob("**/*.txt"), key=lambda p: p.stat().st_mtime) if runs_dir.exists() else []
+# Deduplicate by content hash, keep most recent copy
+seen, my_runs = set(), []
+for p in reversed(all_runs):
+    h = hash(p.read_bytes())
+    if h not in seen:
+        seen.add(h)
+        my_runs.insert(0, p)
+most_recent = my_runs[-1] if my_runs else None
 
 baseline_colors = ["#AAAAAA", "#F4A261", "#E76F51"]  # grey, warm orange, coral-red
 my_colors       = ["#06D6A0", "#118AB2", "#FFD166", "#EF476F"]  # teal, blue, yellow, pink
@@ -97,13 +115,15 @@ for ax, xlabel, x_key in [
                       linestyle="--", alpha=0.85, label=label)
 
     for i, run_path in enumerate(my_runs):
-        color = my_colors[i % len(my_colors)]
+        is_latest = (run_path == most_recent)
+        color = "#FF0000" if is_latest else my_colors[i % len(my_colors)]
+        lw    = 2.8 if is_latest else 2.0
+        label = f"NS3+FTRL (latest)" if is_latest else f"NS3+FTRL: {run_path.stem[:24]}"
         steps, losses, times = parse_log(run_path)
         if not steps:
             continue
         xs = steps if x_key == "steps" else times
-        label = f"NS3+FTRL: {run_path.stem[:40]}"
-        plot_segments(ax, xs, losses, color=color, linewidth=2.4,
+        plot_segments(ax, xs, losses, color=color, linewidth=lw,
                       linestyle="-", alpha=1.0, label=label)
 
     ax.set_ylim(3.2, 5.0)
