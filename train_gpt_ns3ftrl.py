@@ -161,10 +161,14 @@ class GPT(nn.Module):
 ########################################
 
 # NS3+FTRL: 3 Polar Express iterations + first-order FTRL correction.
-# Replaces the 12-iter Newton-Schulz. After 3 iters to get polar factor Q,
-# blends Q with the raw gradient G:
-#   s_bar = <Q, G> / sqrt(min(m,n))    (mean singular value estimate)
-#   update = (1 - eta*s_bar)*Q + eta*G, renormed to sqrt(min(m,n)) Frobenius norm
+# eta=0.0 → pure NS3 (no FTRL blend), eta>0 → blend toward raw gradient.
+# Controlled by --eta argument (default 0.0 = pure NS3 as sanity check).
+import argparse
+_parser = argparse.ArgumentParser()
+_parser.add_argument("--eta", type=float, default=0.0)
+_args, _ = _parser.parse_known_args()
+FTRL_ETA = _args.eta
+
 _ns3_coeffs = [
     (8.156554524902461, -22.48329292557795, 15.878769915207462),
     (4.042929935166739, -2.808917465908714, 0.5000178451051316),
@@ -172,7 +176,7 @@ _ns3_coeffs = [
 ]
 
 @torch.compile
-def muon_update(grad, momentum, mu=0.95, nesterov=True, eta=0.3):
+def muon_update(grad, momentum, mu=0.95, nesterov=True):
     momentum.lerp_(grad, 1 - mu)
     g = grad.lerp_(momentum, mu) if nesterov else momentum
 
@@ -183,24 +187,26 @@ def muon_update(grad, momentum, mu=0.95, nesterov=True, eta=0.3):
 
     X = g.bfloat16()
     X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.02 + 1e-6)
-    G_scaled = X.clone()
+
+    if FTRL_ETA > 0.0:
+        G_scaled = X.clone()
 
     for a, b, c in _ns3_coeffs:
         A = X.mT @ X
         B = b * A + c * (A @ A)
         X = a * X + X @ B
-    Q = X
 
-    m, n = g.size(-2), g.size(-1)
-    sqrt_r = float(min(m, n)) ** 0.5
-    s_bar = (Q * G_scaled).sum(dim=(-2, -1), keepdim=True) / sqrt_r
-    update = (1.0 - eta * s_bar) * Q + eta * G_scaled
-    update = update * (sqrt_r / (update.norm(dim=(-2, -1), keepdim=True).clamp_min(1e-6)))
+    if FTRL_ETA > 0.0:
+        m, n = g.size(-2), g.size(-1)
+        sqrt_r = float(min(m, n)) ** 0.5
+        s_bar = (X * G_scaled).sum(dim=(-2, -1), keepdim=True) / sqrt_r
+        X = (1.0 - FTRL_ETA * s_bar) * X + FTRL_ETA * G_scaled
+        X = X * (sqrt_r / (X.norm(dim=(-2, -1), keepdim=True).clamp_min(1e-6)))
 
     if transposed:
-        update = update.mT
-    update *= max(1, grad.size(-2) / grad.size(-1))**0.5
-    return update
+        X = X.mT
+    X *= max(1, grad.size(-2) / grad.size(-1))**0.5
+    return X
 
 class Muon(torch.optim.Optimizer):
     def __init__(self, params, lr=0.02, weight_decay=0, mu=0.95):
