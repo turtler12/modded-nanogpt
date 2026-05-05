@@ -65,17 +65,24 @@ baselines = {
 
 runs_dir = HERE / "runs"
 all_runs = sorted(runs_dir.glob("**/*.txt"), key=lambda p: p.stat().st_mtime) if runs_dir.exists() else []
-# Deduplicate by content hash, keep most recent copy
+# Deduplicate by content hash, keep most recent mtime copy
 seen, my_runs = set(), []
 for p in reversed(all_runs):
     h = hash(p.read_bytes())
     if h not in seen:
         seen.add(h)
         my_runs.insert(0, p)
-most_recent = my_runs[-1] if my_runs else None
+
+# Label runs: check whether they contain our NS3+FTRL code
+def run_label(path):
+    text = path.read_text()
+    if "polar_express_with_ftrl" in text:
+        return f"NS3+FTRL: {path.stem[:20]}"
+    else:
+        return f"Other run: {path.stem[:20]}"
 
 baseline_colors = ["#AAAAAA", "#F4A261", "#E76F51"]  # grey, warm orange, coral-red
-my_colors       = ["#06D6A0", "#118AB2", "#FFD166", "#EF476F"]  # teal, blue, yellow, pink
+my_colors       = ["#FF0000", "#06D6A0", "#118AB2", "#FFD166"]  # red first for NS3+FTRL
 
 def plot_segments(ax, xs, ys, color, linewidth, linestyle, alpha, label):
     """Plot segments split on x resets (x==0) to avoid spurious connecting lines."""
@@ -115,15 +122,13 @@ for ax, xlabel, x_key in [
                       linestyle="--", alpha=0.85, label=label)
 
     for i, run_path in enumerate(my_runs):
-        is_latest = (run_path == most_recent)
-        color = "#FF0000" if is_latest else my_colors[i % len(my_colors)]
-        lw    = 2.8 if is_latest else 2.0
-        label = f"NS3+FTRL (latest)" if is_latest else f"NS3+FTRL: {run_path.stem[:24]}"
+        color = my_colors[i % len(my_colors)]
+        label = run_label(run_path)
         steps, losses, times = parse_log(run_path)
         if not steps:
             continue
         xs = steps if x_key == "steps" else times
-        plot_segments(ax, xs, losses, color=color, linewidth=lw,
+        plot_segments(ax, xs, losses, color=color, linewidth=2.4,
                       linestyle="-", alpha=1.0, label=label)
 
     ax.set_ylim(3.2, 5.0)
