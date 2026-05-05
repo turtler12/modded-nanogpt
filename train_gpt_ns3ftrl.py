@@ -166,6 +166,7 @@ class GPT(nn.Module):
 import argparse
 _parser = argparse.ArgumentParser()
 _parser.add_argument("--eta", type=float, default=0.0)
+_parser.add_argument("--num-trials", type=int, default=1)
 _args, _ = _parser.parse_known_args()
 FTRL_ETA = _args.eta
 
@@ -275,7 +276,7 @@ model = GPT(vocab_size=50304, num_layers=12, model_dim=768).cuda()
 model.compile(dynamic=False)
 
 
-num_trials = int(sys.argv[-1]) if len(sys.argv) > 1 else 1
+num_trials = _args.num_trials
 
 for _ in range(num_trials):
 
