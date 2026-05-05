@@ -65,21 +65,31 @@ baselines = {
 
 runs_dir = HERE / "runs"
 all_runs = sorted(runs_dir.glob("**/*.txt"), key=lambda p: p.stat().st_mtime) if runs_dir.exists() else []
-# Deduplicate by content hash, keep most recent mtime copy
+# Deduplicate by content hash, keep the copy with the most descriptive name (prefer named over uuid)
 seen, my_runs = set(), []
 for p in reversed(all_runs):
     h = hash(p.read_bytes())
     if h not in seen:
         seen.add(h)
         my_runs.insert(0, p)
+    else:
+        # If a named version exists, prefer it over a uuid name
+        existing = next(x for x in my_runs if hash(x.read_bytes()) == h)
+        if len(p.stem) < len(existing.stem):  # shorter = named (e.g. ns3_ftrl_run1)
+            my_runs[my_runs.index(existing)] = p
 
-# Label runs: check whether they contain our NS3+FTRL code
 def run_label(path):
     text = path.read_text()
-    if "polar_express_with_ftrl" in text:
-        return f"NS3+FTRL: {path.stem[:20]}"
+    has_ftrl = "polar_express_with_ftrl" in text
+    # Use friendly name if available, else shorten uuid
+    name = path.stem if len(path.stem) < 30 else path.stem[:8] + "..."
+    final = next((l for l in text.splitlines()[::-1] if "val_loss:" in l and "step:" in l), "")
+    val = re.search(r'val_loss:([0-9.]+)', final)
+    suffix = f"  [final {val.group(1)}]" if val else ""
+    if has_ftrl:
+        return f"NS3+FTRL — {name}{suffix}"
     else:
-        return f"Other run: {path.stem[:20]}"
+        return f"Other — {name}{suffix}"
 
 baseline_colors = ["#AAAAAA", "#F4A261", "#E76F51"]  # grey, warm orange, coral-red
 my_colors       = ["#FF0000", "#06D6A0", "#118AB2", "#FFD166"]  # red first for NS3+FTRL
