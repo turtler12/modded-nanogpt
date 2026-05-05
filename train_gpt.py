@@ -247,6 +247,54 @@ def polar_express(grad_chunk: torch.Tensor, momentum_buffer: torch.Tensor, momen
 
     return X
 
+
+@torch.compile(dynamic=False, fullgraph=True)
+def polar_express_with_ftrl(grad_chunk: torch.Tensor, momentum_buffer: torch.Tensor,
+                             momentum_t: torch.Tensor, ftrl_eta_t: torch.Tensor):
+    """
+    NS3 + FTRL correction: 3 Polar Express iterations then a first-order FTRL blend.
+
+    After orthogonalizing to get Q, we blend back toward the raw gradient:
+      s_bar = <Q, G> / sqrt(min(m,n))   (mean singular value estimate)
+      update = (1 - eta*s_bar)*Q + eta*G
+    then renormalize to sqrt(min(m,n)) Frobenius norm to match standard Muon scale.
+
+    Uses only 9 matmuls vs 15 for full Polar Express.
+    """
+    momentum = momentum_t.to(grad_chunk.dtype)
+    momentum_buffer.lerp_(grad_chunk, 1 - momentum)
+    g = grad_chunk.lerp_(momentum_buffer, momentum)
+
+    X = g.bfloat16()
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) * (1 + 2e-2) + 1e-6)
+    G_scaled = X.clone()  # save normalized grad before NS overwrites X
+
+    is_tall = g.size(-2) > g.size(-1)
+    ns3_coeffs = polar_express_coeffs[:3]
+
+    if is_tall:
+        for a, b, c in ns3_coeffs:
+            A = X.mT @ X
+            B = b * A + c * (A @ A)
+            X = a * X + X @ B
+    else:
+        for a, b, c in ns3_coeffs:
+            A = X @ X.mT
+            B = b * A + c * (A @ A)
+            X = a * X + B @ X
+    Q = X
+
+    m, n = g.size(-2), g.size(-1)
+    sqrt_r = float(min(m, n)) ** 0.5
+    nuclear_norm = (Q * G_scaled).sum(dim=(-2, -1), keepdim=True)
+    s_bar = nuclear_norm / sqrt_r
+    eta = ftrl_eta_t.to(Q.dtype)
+    update = (1.0 - eta * s_bar) * Q + eta * G_scaled
+    update = update * (sqrt_r / (update.norm(dim=(-2, -1), keepdim=True).clamp_min(1e-6)))
+
+    return update
+
+
 # -----------------------------------------------------------------------------
 # Sparse Comms for bigram embedding gradient reduce-scatter
 def _sparse_comms_active():
@@ -362,6 +410,7 @@ class ParamConfig:
     momentum: float | None = None
     beta2: float | None = None
     per_matrix_lr_mul: list[float] | None = None
+    ftrl_eta: float | None = None
 
 
 class NorMuonAndAdam:
@@ -454,6 +503,7 @@ class NorMuonAndAdam:
         self._eff_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._eff_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._momentum_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._ftrl_eta_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
 
         # Track async operations
         self._reduce_futures: dict[nn.Parameter, tuple] = {}
@@ -529,6 +579,7 @@ class NorMuonAndAdam:
                 momentum=self.normuon_defaults["momentum"],
                 beta2=self.normuon_defaults["beta2"],
                 per_matrix_lr_mul=per_matrix_lr_mul,
+                ftrl_eta=self.normuon_defaults.get("ftrl_eta"),
             )
         else:
             raise ValueError(f"Unknown optim type: {optim}")
@@ -870,12 +921,18 @@ class NorMuonAndAdam:
         self._eff_lr_t.fill_(p_cfg.lr_mul * p_cfg.lr)
         self._eff_wd_t.fill_(p_cfg.wd_mul * p_cfg.weight_decay * p_cfg.lr)
 
-        # Fused Nesterov momentum + Polar Express orthogonalization
-        is_large_matrix = chunk_shape[-2] > 1024
-        v_chunk = polar_express(
-            grad_chunk, p_state["momentum_buffer"], self._momentum_t,
-            split_baddbmm=is_large_matrix,
-        )
+        # Nesterov momentum + orthogonalization (NS3+FTRL or full Polar Express)
+        if p_cfg.ftrl_eta is not None:
+            self._ftrl_eta_t.fill_(p_cfg.ftrl_eta)
+            v_chunk = polar_express_with_ftrl(
+                grad_chunk, p_state["momentum_buffer"], self._momentum_t, self._ftrl_eta_t,
+            )
+        else:
+            is_large_matrix = chunk_shape[-2] > 1024
+            v_chunk = polar_express(
+                grad_chunk, p_state["momentum_buffer"], self._momentum_t,
+                split_baddbmm=is_large_matrix,
+            )
 
         # Variance reduction
         red_dim = -1 if chunk_shape[-2] >= chunk_shape[-1] else -2
@@ -1729,6 +1786,7 @@ class TrainingManager():
             momentum=0.95,
             beta2=0.9,
             weight_decay=1.2,
+            ftrl_eta=0.3,
         )
 
         self.optimizer = NorMuonAndAdam(
