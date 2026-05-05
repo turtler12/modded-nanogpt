@@ -63,36 +63,27 @@ baselines = {
     "ContraNorMuon (3225 steps, SOTA)": HERE / "sota_baseline/contra_muon_sota.txt",
 }
 
+# Only plot explicitly named runs (skip uuid-named files which are old/misc experiments)
 runs_dir = HERE / "runs"
-all_runs = sorted(runs_dir.glob("**/*.txt"), key=lambda p: p.stat().st_mtime) if runs_dir.exists() else []
-# Deduplicate by content hash, keep the copy with the most descriptive name (prefer named over uuid)
-seen, my_runs = set(), []
-for p in reversed(all_runs):
-    h = hash(p.read_bytes())
-    if h not in seen:
-        seen.add(h)
-        my_runs.insert(0, p)
-    else:
-        # If a named version exists, prefer it over a uuid name
-        existing = next(x for x in my_runs if hash(x.read_bytes()) == h)
-        if len(p.stem) < len(existing.stem):  # shorter = named (e.g. ns3_ftrl_run1)
-            my_runs[my_runs.index(existing)] = p
+all_runs = sorted(runs_dir.glob("*.txt"), key=lambda p: p.stat().st_mtime) if runs_dir.exists() else []
+my_runs = [p for p in all_runs if not re.match(r'^[0-9a-f]{8}-', p.stem)]
 
 def run_label(path):
     text = path.read_text()
-    has_ftrl = "polar_express_with_ftrl" in text
-    # Use friendly name if available, else shorten uuid
-    name = path.stem if len(path.stem) < 30 else path.stem[:8] + "..."
-    final = next((l for l in text.splitlines()[::-1] if "val_loss:" in l and "step:" in l), "")
+    final = next((l for l in text.splitlines()[::-1] if re.match(r'^step:\d+/\d+\s+val_loss:', l)), "")
     val = re.search(r'val_loss:([0-9.]+)', final)
-    suffix = f"  [final {val.group(1)}]" if val else ""
-    if has_ftrl:
-        return f"NS3+FTRL — {name}{suffix}"
+    last_step = re.search(r'^step:(\d+)/(\d+)', final)
+    suffix = f"  [{last_step.group(1)}/{last_step.group(2)} steps, loss {val.group(1)}]" if val and last_step else ""
+    # ns3ftrl_benchmark is the apples-to-apples benchmark run
+    if "ns3ftrl_benchmark" in path.stem:
+        return f"NS3+FTRL benchmark{suffix}"
+    elif "polar_express_with_ftrl" in text or "ns3" in path.stem.lower():
+        return f"NS3+FTRL — {path.stem}{suffix}"
     else:
-        return f"Other — {name}{suffix}"
+        return f"{path.stem}{suffix}"
 
 baseline_colors = ["#AAAAAA", "#F4A261", "#E76F51"]  # grey, warm orange, coral-red
-my_colors       = ["#FF0000", "#06D6A0", "#118AB2", "#FFD166"]  # red first for NS3+FTRL
+my_colors       = ["#FF0000", "#06D6A0", "#118AB2", "#FFD166"]  # red first
 
 def plot_segments(ax, xs, ys, color, linewidth, linestyle, alpha, label):
     """Plot segments split on x resets (x==0) to avoid spurious connecting lines."""
