@@ -24,16 +24,17 @@ mpl.rcParams.update({
     "axes.spines.right": False,
 })
 
-LOG_PATTERN = re.compile(r'step:(\d+)/\d+\s+val_loss:([0-9.]+)')
+LOG_PATTERN = re.compile(r'^step:(\d+)/\d+\s+val_loss:([0-9.]+)\s+train_time:([0-9.]+)s')
 
 def parse_log(path):
-    steps, losses = [], []
+    steps, losses, times = [], [], []
     for line in Path(path).read_text().splitlines():
-        m = LOG_PATTERN.search(line)
+        m = LOG_PATTERN.match(line)
         if m:
             steps.append(int(m.group(1)))
             losses.append(float(m.group(2)))
-    return steps, losses
+            times.append(float(m.group(3)))
+    return steps, losses, times
 
 def smooth(losses, k=1):
     """Simple moving average for readability."""
@@ -55,44 +56,69 @@ baselines = {
 
 my_runs = sorted((HERE / "runs").glob("**/*.txt")) if (HERE / "runs").exists() else []
 
-fig, ax = plt.subplots(figsize=(9, 5.5))
+baseline_colors = ["#AAAAAA", "#F4A261", "#E76F51"]  # grey, warm orange, coral-red
+my_colors       = ["#06D6A0", "#118AB2", "#FFD166", "#EF476F"]  # teal, blue, yellow, pink
 
-baseline_colors = ["#9E9E9E", "#607D8B", "#1565C0"]
-my_colors = ["#E53935", "#FF6F00", "#2E7D32", "#6A1B9A"]
+def plot_segments(ax, xs, ys, color, linewidth, linestyle, alpha, label):
+    """Plot segments split on x resets (x==0) to avoid spurious connecting lines."""
+    seg_x, seg_y = [], []
+    first = True
+    for x, y in zip(xs, ys):
+        if x == 0:
+            if seg_x:
+                ax.plot(seg_x, seg_y, color=color, linewidth=linewidth,
+                        linestyle=linestyle, alpha=alpha,
+                        label=label if first else "_nolegend_")
+                first = False
+            seg_x, seg_y = [], []
+            continue
+        seg_x.append(x)
+        seg_y.append(y)
+    if seg_x:
+        ax.plot(seg_x, seg_y, color=color, linewidth=linewidth,
+                linestyle=linestyle, alpha=alpha,
+                label=label if first else "_nolegend_")
 
-for (label, path), color in zip(baselines.items(), baseline_colors):
-    if not path.exists():
-        print(f"Warning: baseline not found: {path}", file=sys.stderr)
-        continue
-    steps, losses = parse_log(path)
-    if not steps:
-        continue
-    # Only plot from step > 0 (skip the step:0 initialization)
-    pairs = [(s, l) for s, l in zip(steps, losses) if s > 0]
-    if not pairs:
-        continue
-    s, l = zip(*pairs)
-    ax.plot(s, l, color=color, linewidth=1.5, linestyle="--", alpha=0.7, label=label)
+fig, (ax_step, ax_time) = plt.subplots(1, 2, figsize=(16, 5.5))
 
-for i, run_path in enumerate(my_runs):
-    color = my_colors[i % len(my_colors)]
-    steps, losses = parse_log(run_path)
-    pairs = [(s, l) for s, l in zip(steps, losses) if s > 0]
-    if not pairs:
-        continue
-    s, l = zip(*pairs)
-    label = f"NS3+FTRL: {run_path.stem[:40]}"
-    ax.plot(s, l, color=color, linewidth=2.0, label=label)
+for ax, xlabel, x_key in [
+    (ax_step, "Training step",    "steps"),
+    (ax_time, "Training time (s)", "times"),
+]:
+    for (label, path), color in zip(baselines.items(), baseline_colors):
+        if not path.exists():
+            print(f"Warning: baseline not found: {path}", file=sys.stderr)
+            continue
+        steps, losses, times = parse_log(path)
+        if not steps:
+            continue
+        xs = steps if x_key == "steps" else times
+        plot_segments(ax, xs, losses, color=color, linewidth=1.8,
+                      linestyle="--", alpha=0.85, label=label)
 
-# Target line
-ax.axhline(3.28, color="black", linewidth=0.8, linestyle=":", alpha=0.5)
-ax.text(50, 3.282, "Target (3.28)", fontsize=8, color="black", alpha=0.6)
+    for i, run_path in enumerate(my_runs):
+        color = my_colors[i % len(my_colors)]
+        steps, losses, times = parse_log(run_path)
+        if not steps:
+            continue
+        xs = steps if x_key == "steps" else times
+        label = f"NS3+FTRL: {run_path.stem[:40]}"
+        plot_segments(ax, xs, losses, color=color, linewidth=2.4,
+                      linestyle="-", alpha=1.0, label=label)
 
-ax.set_xlabel("Training step", fontsize=11)
-ax.set_ylabel("Validation loss", fontsize=11)
-ax.set_title("NS3+FTRL vs SOTA baselines", fontsize=13, fontweight="bold")
-ax.legend(fontsize=8, loc="upper right")
-ax.set_ylim(top=min(6.0, ax.get_ylim()[1]))
+    ax.set_ylim(3.2, 5.0)
+    ax.axhline(3.28, color="black", linewidth=0.8, linestyle=":", alpha=0.5)
+    ax.text(ax.get_xlim()[0] + (ax.get_xlim()[1] - ax.get_xlim()[0]) * 0.01,
+            3.295, "Target (3.28)", fontsize=8, color="black", alpha=0.6)
+    ax.set_xlabel(xlabel, fontsize=11)
+    ax.set_ylabel("Validation loss", fontsize=11)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+ax_step.set_title("Val loss vs step", fontsize=13, fontweight="bold")
+ax_time.set_title("Val loss vs time", fontsize=13, fontweight="bold")
+ax_step.legend(fontsize=8, loc="upper right")
+ax_time.legend(fontsize=8, loc="upper right")
 
 out = HERE / "figure.png"
 fig.tight_layout()
