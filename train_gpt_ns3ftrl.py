@@ -160,15 +160,25 @@ class GPT(nn.Module):
 #              Optimizer               #
 ########################################
 
-# NS3+FTRL: 3 Polar Express iterations + first-order FTRL correction.
-# eta=0.0 → pure NS3 (no FTRL blend), eta>0 → blend toward raw gradient.
-# Controlled by --eta argument (default 0.0 = pure NS3 as sanity check).
+# NS3+FTRL with scheduled eta: start at eta0=0.3, decay exponentially,
+# switch to pure Muon (eta=0) at switch_step.
+# η(t) = 0.3 * exp(-λ*t), λ = ln(3)/100  →  η(100)=0.1, η(200)≈0.033
+# Switch step scaled from nanochat (200/2205 * 3350) ≈ 300.
 import argparse
+import math as _math
 _parser = argparse.ArgumentParser()
-_parser.add_argument("--eta", type=float, default=0.0)
+_parser.add_argument("--switch-step", type=int, default=300,
+                     help="Step at which to switch from NS3+FTRL to pure Muon (0=always pure Muon)")
 _parser.add_argument("--num-trials", type=int, default=1)
 _args, _ = _parser.parse_known_args()
-FTRL_ETA = _args.eta
+
+_ETA0 = 0.3
+_ETA_LAMBDA = _math.log(3.0) / 100.0   # η(100)=0.1, η(200)≈0.033
+
+def get_ftrl_eta(step):
+    if _args.switch_step == 0 or step >= _args.switch_step:
+        return 0.0
+    return _ETA0 * _math.exp(-_ETA_LAMBDA * step)
 
 _ns3_coeffs = [
     (8.156554524902461, -22.48329292557795, 15.878769915207462),
@@ -177,32 +187,33 @@ _ns3_coeffs = [
 ]
 
 @torch.compile
-def muon_update(grad, momentum, mu=0.95, nesterov=True):
+def muon_update(grad, momentum, mu_t, ftrl_eta_t, nesterov=True):
+    # mu_t and ftrl_eta_t are 0-d CPU tensors so torch.compile sees them as
+    # dynamic scalars rather than Python constants (avoids per-step retracing)
+    mu = mu_t.item()
+    ftrl_eta = ftrl_eta_t.item()
     momentum.lerp_(grad, 1 - mu)
     g = grad.lerp_(momentum, mu) if nesterov else momentum
 
-    # Orient so matrix is tall
     transposed = g.size(-2) < g.size(-1)
     if transposed:
         g = g.mT
 
     X = g.bfloat16()
     X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.02 + 1e-6)
-
-    if FTRL_ETA > 0.0:
-        G_scaled = X.clone()
+    G_scaled = X.clone()
 
     for a, b, c in _ns3_coeffs:
         A = X.mT @ X
         B = b * A + c * (A @ A)
         X = a * X + X @ B
 
-    if FTRL_ETA > 0.0:
-        m, n = g.size(-2), g.size(-1)
-        sqrt_r = float(min(m, n)) ** 0.5
-        s_bar = (X * G_scaled).sum(dim=(-2, -1), keepdim=True) / sqrt_r
-        X = (1.0 - FTRL_ETA * s_bar) * X + FTRL_ETA * G_scaled
-        X = X * (sqrt_r / (X.norm(dim=(-2, -1), keepdim=True).clamp_min(1e-6)))
+    # FTRL blend: mix polar factor Q with raw gradient
+    m, n = g.size(-2), g.size(-1)
+    sqrt_r = float(min(m, n)) ** 0.5
+    s_bar = (X * G_scaled).sum(dim=(-2, -1), keepdim=True) / sqrt_r
+    X = (1.0 - ftrl_eta * s_bar) * X + ftrl_eta * G_scaled
+    X = X * (sqrt_r / (X.norm(dim=(-2, -1), keepdim=True).clamp_min(1e-6)))
 
     if transposed:
         X = X.mT
@@ -210,10 +221,12 @@ def muon_update(grad, momentum, mu=0.95, nesterov=True):
     return X
 
 class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr=0.02, weight_decay=0, mu=0.95):
+    def __init__(self, params, lr=0.02, weight_decay=0, mu=0.95, ftrl_eta=0.0):
         assert isinstance(params, list) and len(params) >= 1 and isinstance(params[0], torch.nn.Parameter)
         params = sorted(params, key=lambda x: x.size(), reverse=True)
-        defaults = dict(lr=lr, weight_decay=weight_decay, mu=mu)
+        defaults = dict(lr=lr, weight_decay=weight_decay, mu=mu, ftrl_eta=ftrl_eta)
+        self._mu_t       = torch.tensor(mu,       dtype=torch.float32, device="cpu")
+        self._ftrl_eta_t = torch.tensor(ftrl_eta, dtype=torch.float32, device="cpu")
         super().__init__(params, defaults)
 
     @torch.no_grad()
@@ -221,6 +234,8 @@ class Muon(torch.optim.Optimizer):
         world_size = dist.get_world_size()
         rank = dist.get_rank()
         for group in self.param_groups:
+            self._mu_t.fill_(group["mu"])
+            self._ftrl_eta_t.fill_(group["ftrl_eta"])
             params = group["params"]
             params_pad = params + [torch.empty_like(params[-1])] * (world_size - len(params) % world_size)
             for base_i in range(0, len(params), world_size):
@@ -229,7 +244,8 @@ class Muon(torch.optim.Optimizer):
                     state = self.state[p]
                     if len(state) == 0:
                         state["momentum"] = torch.zeros_like(p)
-                    update = muon_update(p.grad, state["momentum"], mu=group["mu"])
+                    update = muon_update(p.grad, state["momentum"],
+                                        self._mu_t, self._ftrl_eta_t)
                     p.mul_(1 - group["lr"] * group["weight_decay"])
                     p.add_(update, alpha=-group["lr"])
                 dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
@@ -250,7 +266,7 @@ assert 8 % dist.get_world_size() == 0
 # logging setup
 if dist.get_rank() == 0:
     os.makedirs("logs", exist_ok=True)
-    logfile = f"logs/{uuid.uuid4()}.txt"
+    logfile = f"logs/ns3ftrl_switch{_args.switch_step}.txt"
     print(logfile)
 def print0(s, console=False, log=True):
     if dist.get_rank() == 0:
@@ -277,6 +293,11 @@ model.compile(dynamic=False)
 
 
 num_trials = _args.num_trials
+
+def get_muon_momentum(step):
+    """Ramp momentum from 0.85 → 0.95 over first 300 steps (nanochat schedule)."""
+    frac = min(step / 300, 1.0)
+    return (1 - frac) * 0.85 + frac * 0.95
 
 for _ in range(num_trials):
 
@@ -311,7 +332,7 @@ for _ in range(num_trials):
                         dict(params=[p for p in model.parameters() if p.ndim < 2], lr=0.01)],
                        betas=(0.8, 0.95), eps=1e-10, weight_decay=0, fused=True)
     optimizer2 = Muon([p for p in model.blocks.parameters() if p.ndim >= 2],
-                      lr=0.035, weight_decay=0.025)
+                      lr=0.035, weight_decay=0.025, mu=0.85, ftrl_eta=_ETA0)
     optimizers = [optimizer1, optimizer2]
     assert set(p for opt in optimizers for group in opt.param_groups
                for p in group["params"]) == set(model.parameters())
@@ -323,13 +344,14 @@ for _ in range(num_trials):
     def set_hparams(step, cooldown_frac=0.7):
         progress = step / train_steps
         assert 0 <= progress < 1
-        if progress < 1 - cooldown_frac:
-            eta = 1.0
-        else:
-            eta = (1 - progress) / cooldown_frac
+        lr_scale = 1.0 if progress < 1 - cooldown_frac else (1 - progress) / cooldown_frac
         for opt in optimizers:
             for group in opt.param_groups:
-                group["lr"] = group["initial_lr"] * eta
+                group["lr"] = group["initial_lr"] * lr_scale
+        # momentum warmup + FTRL eta schedule for Muon
+        for group in optimizer2.param_groups:
+            group["mu"] = get_muon_momentum(step)
+            group["ftrl_eta"] = get_ftrl_eta(step)
 
 
     ########################################
