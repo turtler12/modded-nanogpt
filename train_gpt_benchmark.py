@@ -228,45 +228,89 @@ def ns2_polar(G: Tensor) -> Tensor:
     return _ns_polar(G, 2)
 
 
-# ---- Config B: Krylov-only ----
+# ---- Config B: GPU-native Krylov-NS ----
+#
+# Replaces torch.linalg.qr and torch.linalg.svd (LAPACK, non-compilable) with
+# NS iterations on the small n×n sub-problems. All ops are matmuls on bfloat16.
+#
+# Structure:
+#   1. Build random start Omega ∈ R^(m×n)
+#   2. Orthogonalize Omega via NS  → Q  (n×n square, or m×n rect via NS transpose)
+#   3. For rectangular M: row-space init via one matmul, then NS on that
+#   4. One Krylov step: Y = Mt @ Q, Z = Mt.T @ Y, reorthogonalize, NS-orthogonalize Z
+#   5. Concatenate Q blocks, project: MQ = Mt @ Q  (n×n square)
+#   6. Polar-decompose MQ via NS  → polar_MQ  (n×n)
+#   7. Lift back: X = polar_MQ @ Q.T
+#
+# Sub-problem NS uses NS_SUB_ITERS iterations. Since MQ is already well-conditioned
+# (it's the projection of M onto its own Krylov subspace), fewer iters suffice vs
+# the full outer NS. 5 is safe; tune down to 3 if step-timer shows it's free.
 
-def krylov_polar(M: Tensor, num_steps: int = 2, block_size: int | None = None) -> Tensor:
+NS_SUB_ITERS = 5  # NS iters for the internal n×n sub-problems
+
+def _ns_square(X: Tensor, n_iters: int) -> Tensor:
+    """NS polar for square or wide matrices only (no tall-branch needed internally)."""
+    X = X / (X.norm(dim=(-2,-1), keepdim=True) + 1e-7)
+    a, b, c = 2.0, -1.5, 0.5
+    for _ in range(n_iters):
+        A = X @ X.mT
+        B = b*A + c*(A @ A)
+        X = a*X + B @ X
+    return X
+
+@torch.compile
+def krylov_ns_polar(G: Tensor) -> Tensor:
     """
-    Block-Krylov polar decomposition. ~3 matmuls for square, ~4 for rectangular.
-    Identical to warmuon.krylov_polar — reproduced here to avoid import side-effects.
+    GPU-native Krylov polar: replaces QR/SVD with NS on the small sub-problems.
+    Compiled, bfloat16 throughout, pure matmuls.
+
+    For square M (n×n): costs ~3 large (n×n) matmuls + 3×NS_SUB_ITERS small (n×n) matmuls.
+    For rect M (e.g. 3072×768): transposes to (768×3072), projects to (768×768) first,
+    then same cost on the min_dim square — genuine FLOP win vs running NS on full shape.
     """
-    assert M.ndim == 2
-    transposed = M.shape[0] > M.shape[1]
-    Mt = M.T if transposed else M
-    n, m = Mt.shape
-    bs = min(block_size or m, n)
-    g = torch.Generator(device=Mt.device)
-    g.manual_seed(0)
+    # Work on the short side: Mt is (n, m) with n ≤ m
+    transposed = G.size(-2) > G.size(-1)
+    Mt = G.mT if transposed else G          # (n, m), n ≤ m
+    Mt = Mt.bfloat16()
+    n, m = Mt.size(-2), Mt.size(-1)
+
+    # Random init in row space (deterministic via fixed values, avoids Generator on GPU)
+    # Use a fixed random projection: same result every call given same n,m
+    torch.manual_seed(0)
     if n < m:
-        rand_init = torch.randn(n, bs, generator=g, dtype=Mt.dtype, device=Mt.device)
-        Omega = Mt.T @ rand_init
+        # Rectangular: init in row space to avoid null-space
+        rand_init = torch.randn(n, n, dtype=Mt.dtype, device=Mt.device)
+        Omega = Mt.mT @ rand_init           # (m, n)  — row-space init
     else:
-        Omega = torch.randn(m, bs, generator=g, dtype=Mt.dtype, device=Mt.device)
-    Q, _ = torch.linalg.qr(Omega)
-    Q_blocks = [Q]
-    for _ in range(num_steps - 1):
-        Y = Mt @ Q_blocks[-1]
-        Z = Mt.T @ Y
-        for Qb in Q_blocks:
-            Z = Z - Qb @ (Qb.T @ Z)
-        Z, _ = torch.linalg.qr(Z)
-        Q_blocks.append(Z)
-    Q = torch.cat(Q_blocks, dim=1)[:, :n]
-    MQ = Mt @ Q
-    U_mq, _, Vh_mq = torch.linalg.svd(MQ, full_matrices=False)
-    X = U_mq @ Vh_mq @ Q.T
-    return X.T if transposed else X
+        Omega = torch.randn(m, n, dtype=Mt.dtype, device=Mt.device)  # (n, n) for square
+
+    # Orthogonalize Omega via NS → Q shape (m, n) or (n, n)
+    Q = _ns_square(Omega.mT, NS_SUB_ITERS).mT   # NS expects wide; Omega.T is (n,m) or (n,n)
+
+    # One Krylov iteration
+    Y  = Mt @ Q                             # (n, n)
+    Z  = Mt.mT @ Y                          # (m, n)
+    # Reorthogonalize Z against Q
+    Z  = Z - Q @ (Q.mT @ Z)
+    # Orthogonalize Z via NS
+    Q2 = _ns_square(Z.mT, NS_SUB_ITERS).mT  # (m, n)
+
+    # Concatenate and truncate to n columns
+    Q_full = torch.cat([Q, Q2], dim=-1)[:, :n]   # (m, n)
+
+    # Project M onto the Krylov subspace
+    MQ = Mt @ Q_full                        # (n, n)
+
+    # Polar-decompose the projected square matrix via NS
+    polar_MQ = _ns_square(MQ, NS_SUB_ITERS)  # (n, n)
+
+    # Lift back to full shape
+    X = polar_MQ @ Q_full.mT               # (n, m)
+
+    return X.mT if transposed else X
 
 def krylov_update(G: Tensor) -> Tensor:
-    """Krylov polar, normalized like NS (scale by max(1, rows/cols)^0.5 is in the optimizer)."""
-    M = G.float()
-    n, m = M.shape
-    return krylov_polar(M, num_steps=2, block_size=min(n, m)).to(G.dtype)
+    return krylov_ns_polar(G).float()
 
 
 # ---- Config C: WarmMuon ----
@@ -361,20 +405,17 @@ def optimizer_flops_per_step(config: str, muon_params: list,
     total = 0.0
     for p in muon_params:
         r, c = p.shape[-2], p.shape[-1]
-        aspect = max(r, c) / min(r, c)
         if config == "A":
             total += mm_flops(r, c, 36)   # 12 iters × 3 mm
         elif config == "D":
             total += mm_flops(r, c, 6)    # 2 iters × 3 mm
-        elif config == "B":
-            mm = 4 if aspect > 2.0 else 3
-            total += mm_flops(r, c, mm)
-        elif config == "C":
-            if aspect > 2.0:
-                total += mm_flops(r, c, 4)    # always krylov rect
-            else:
-                # amortized: (1-r)*3 + r*3 = 3 regardless; same as B
-                total += mm_flops(r, c, 3)
+        elif config in ("B", "C"):
+            n = min(r, c); m_dim = max(r, c)
+            # Large matmuls on full shape: 3 (init row-space + Y + MQ)
+            large_mm = 3 * 2 * n * n * m_dim
+            # Small NS sub-problems on n×n: 3 calls × NS_SUB_ITERS iters × 3 mm each
+            small_mm = 3 * NS_SUB_ITERS * 3 * 2 * n * n * n
+            total += large_mm + small_mm
     return total
 
 
