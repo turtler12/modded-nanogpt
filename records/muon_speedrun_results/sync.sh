@@ -6,7 +6,7 @@
 REMOTE="root@103.207.149.54"
 PORT="15860"
 KEY="$HOME/.ssh/id_ed25519"
-REMOTE_LOG_DIR="/root/modded-nanogpt/logs"
+REMOTE_LOG_DIR="/workspace/modded-nanogpt/logs"
 LOCAL_DIR="$(dirname "$0")/runs"
 
 mkdir -p "$LOCAL_DIR"

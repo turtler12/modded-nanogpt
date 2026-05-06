@@ -64,8 +64,9 @@ baselines = {
 }
 
 VALID_RUNS = {
-    "ns3_pure.txt":        "NS3 (3 iters, no FTRL)",
-    "ns3ftrl_eta0p05.txt": "NS3+FTRL (eta=0.05)",
+    "ns3_pure.txt":          "NS3 (3 iters, no FTRL)",
+    "ns3ftrl_eta0p05.txt":   "NS3+FTRL (eta=0.05)",
+    "ns3ftrl_switch300.txt": "NS3+FTRL→Muon (switch@300)",
 }
 
 runs_dir = HERE / "runs"
@@ -80,7 +81,7 @@ def run_label(path):
     return f"{base}{suffix}"
 
 baseline_colors = ["#AAAAAA", "#F4A261", "#E76F51"]   # grey, amber, coral
-my_colors       = ["#00B4D8", "#FF006E"]              # sky blue, hot pink
+my_colors       = ["#00B4D8", "#FF006E", "#AAFF00"]   # sky blue, hot pink, lime
 
 def plot_segments(ax, xs, ys, color, linewidth, linestyle, alpha, label):
     """Plot segments split on x resets (x==0) to avoid spurious connecting lines."""
@@ -102,10 +103,28 @@ def plot_segments(ax, xs, ys, color, linewidth, linestyle, alpha, label):
                 linestyle=linestyle, alpha=alpha,
                 label=label if first else "_nolegend_")
 
-fig, (ax_step, ax_time) = plt.subplots(1, 2, figsize=(16, 5.5))
+import math as _math
+import numpy as np
+
+_ETA0       = 0.3
+_ETA_LAMBDA = _math.log(3.0) / 100.0
+_SWITCH_STEP = 300
+_TRAIN_STEPS = 3350
+
+def eta_schedule(step):
+    if step >= _SWITCH_STEP:
+        return 0.0
+    return _ETA0 * _math.exp(-_ETA_LAMBDA * step)
+
+# Layout: 2 rows — top row has val-loss panels, bottom-left has eta schedule
+fig = plt.figure(figsize=(16, 9))
+gs = fig.add_gridspec(2, 2, height_ratios=[3, 1.5], hspace=0.45, wspace=0.3)
+ax_step = fig.add_subplot(gs[0, 0])
+ax_time = fig.add_subplot(gs[0, 1])
+ax_eta  = fig.add_subplot(gs[1, 0])
 
 for ax, xlabel, x_key in [
-    (ax_step, "Training step",    "steps"),
+    (ax_step, "Training step",     "steps"),
     (ax_time, "Training time (s)", "times"),
 ]:
     for (label, path), color in zip(baselines.items(), baseline_colors):
@@ -143,8 +162,37 @@ ax_time.set_title("Val loss vs time", fontsize=13, fontweight="bold")
 ax_step.legend(fontsize=8, loc="upper right")
 ax_time.legend(fontsize=8, loc="upper right")
 
+# --- eta schedule subplot ---
+steps_arr = np.arange(0, _TRAIN_STEPS + 1)
+eta_arr   = np.array([eta_schedule(s) for s in steps_arr])
+
+# FTRL phase
+mask_ftrl = steps_arr < _SWITCH_STEP
+ax_eta.fill_between(steps_arr[mask_ftrl], eta_arr[mask_ftrl], alpha=0.15, color="#AAFF00")
+ax_eta.plot(steps_arr[mask_ftrl], eta_arr[mask_ftrl], color="#AAFF00", linewidth=2.0)
+
+# Muon phase (eta=0)
+mask_muon = steps_arr >= _SWITCH_STEP
+ax_eta.fill_between(steps_arr[mask_muon], eta_arr[mask_muon], alpha=0.08, color="#00B4D8")
+ax_eta.plot(steps_arr[mask_muon], np.zeros(mask_muon.sum()), color="#00B4D8", linewidth=2.0)
+
+# Switch annotation
+ax_eta.axvline(_SWITCH_STEP, color="white", linewidth=1.2, linestyle="--", alpha=0.7)
+ax_eta.text(_SWITCH_STEP + 30, _ETA0 * 0.55, f"switch → pure Muon\n(step {_SWITCH_STEP})",
+            fontsize=8, color="white", alpha=0.85, va="center")
+
+ax_eta.set_xlim(0, _TRAIN_STEPS)
+ax_eta.set_ylim(-0.01, _ETA0 * 1.15)
+ax_eta.set_xlabel("Training step", fontsize=10)
+ax_eta.set_ylabel("FTRL eta (η)", fontsize=10)
+ax_eta.set_title("η schedule: NS3+FTRL → Muon", fontsize=11, fontweight="bold")
+ax_eta.spines["top"].set_visible(False)
+ax_eta.spines["right"].set_visible(False)
+
+# bottom-right: leave empty or add a note
+fig.add_subplot(gs[1, 1]).set_visible(False)
+
 out = HERE / "figure.png"
-fig.tight_layout()
-fig.savefig(out, dpi=150)
+fig.savefig(out, dpi=150, bbox_inches="tight")
 print(f"Saved to {out}")
 plt.show()
