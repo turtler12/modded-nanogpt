@@ -444,7 +444,7 @@ def run_step_timer():
     print0("=" * 70, console=True)
 
     VOCAB = 50304; NLAYERS = 12; DIM = 768
-    BS = 8; SEQ = 1024  # per-GPU batch, same as training
+    BS = 4; SEQ = 1024  # per-GPU microbatch (16 seqs total with 4 accum steps)
 
     model = GPT(vocab_size=VOCAB, num_layers=NLAYERS, model_dim=DIM).cuda()
     # model.compile disabled — we measure loss vs step, not wall-clock speed
@@ -562,9 +562,9 @@ def run_training():
     target_loss  = args.target_loss
 
     VOCAB = 50304; NLAYERS = 12; DIM = 768
-    # 64 sequences per GPU, same per-GPU memory regardless of world_size.
-    mbs = 64   # microbatch sequences per GPU
-    batch_size = mbs * world_size * 1024  # total tokens per step
+    # 16 seqs/microbatch, 4 gradient-accumulation steps → 64 seqs/GPU effective.
+    mbs = 16
+    batch_size = 64 * world_size * 1024  # total tokens per step (64 seqs/GPU)
 
     print0(f"{'='*70}")
     print0(f"Config {config} | seed {seed} | {train_steps} steps | "
