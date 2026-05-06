@@ -447,7 +447,7 @@ def run_step_timer():
     print0("=" * 70, console=True)
 
     VOCAB = 50304; NLAYERS = 12; DIM = 768
-    BS = 8; SEQ = 1024
+    BS = 8 // world_size; SEQ = 1024  # per-GPU batch, same as training
 
     model = GPT(vocab_size=VOCAB, num_layers=NLAYERS, model_dim=DIM).cuda()
     model.compile(dynamic=False)
@@ -565,8 +565,11 @@ def run_training():
     target_loss  = args.target_loss
 
     VOCAB = 50304; NLAYERS = 12; DIM = 768
-    batch_size = 8 * 64 * 1024
-    mbs = 64
+    # Batch size designed for 8 GPUs; scale microbatch count to available GPUs
+    # so each GPU always holds the same memory regardless of world_size.
+    # total tokens constant = 8 * 64 * 1024; mbs per GPU = 64 * (8 // world_size)
+    mbs = 64 * (8 // world_size)   # microbatch sequences per GPU
+    batch_size = mbs * world_size * 1024  # total tokens per step
 
     print0(f"{'='*70}")
     print0(f"Config {config} | seed {seed} | {train_steps} steps | "
