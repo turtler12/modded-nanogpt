@@ -41,10 +41,6 @@ from torch.optim import AdamW
 import torch.nn.functional as F
 import torch.distributed as dist
 
-# Disable Triton autotuning — it clones large activation buffers during
-# kernel benchmarking and OOMs on machines with limited free VRAM headroom.
-os.environ.setdefault("TORCHINDUCTOR_AUTOTUNE", "0")
-os.environ.setdefault("TORCHINDUCTOR_MAX_AUTOTUNE", "0")
 
 
 # ── Parse args before anything dist-related ────────────────────────────────
@@ -224,11 +220,9 @@ def _ns_polar(G: Tensor, n_iters: int) -> Tensor:
         X = X.mT
     return X
 
-@torch.compile
 def ns12_polar(G: Tensor) -> Tensor:
     return _ns_polar(G, 12)
 
-@torch.compile
 def ns2_polar(G: Tensor) -> Tensor:
     return _ns_polar(G, 2)
 
@@ -263,7 +257,6 @@ def _ns_square(X: Tensor, n_iters: int) -> Tensor:
         X = a*X + B @ X
     return X
 
-@torch.compile
 def krylov_ns_polar(G: Tensor) -> Tensor:
     """
     GPU-native Krylov polar: replaces QR/SVD with NS on the small sub-problems.
@@ -330,7 +323,6 @@ def _nesterov_momentum(grad: Tensor, buf: Tensor, mu: float = 0.95) -> Tensor:
     buf.lerp_(grad, 1.0 - mu)
     return grad.lerp_(buf, mu)  # nesterov
 
-@torch.compile
 def _nesterov_momentum_compiled(grad: Tensor, buf: Tensor, mu: float = 0.95) -> Tensor:
     buf.lerp_(grad, 1.0 - mu)
     return grad.lerp_(buf, mu)
@@ -455,7 +447,7 @@ def run_step_timer():
     BS = 8; SEQ = 1024  # per-GPU batch, same as training
 
     model = GPT(vocab_size=VOCAB, num_layers=NLAYERS, model_dim=DIM).cuda()
-    model.compile(dynamic=False)
+    # model.compile disabled — we measure loss vs step, not wall-clock speed
     init_model_weights(model, seed=0)
 
     muon_eligible = [p for p in model.blocks.parameters() if p.ndim >= 2]
@@ -586,7 +578,7 @@ def run_training():
 
     # ---- model ----
     model = GPT(vocab_size=VOCAB, num_layers=NLAYERS, model_dim=DIM).cuda()
-    model.compile(dynamic=False)
+    # model.compile disabled — we measure loss vs step, not wall-clock speed
     init_model_weights(model, seed=seed)
 
     # Broadcast initial weights from rank 0 so all ranks start identically
