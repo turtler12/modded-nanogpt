@@ -41,6 +41,11 @@ from torch.optim import AdamW
 import torch.nn.functional as F
 import torch.distributed as dist
 
+# Disable Triton autotuning — it clones large activation buffers during
+# kernel benchmarking and OOMs on machines with limited free VRAM headroom.
+torch._inductor.config.triton.autotune_pointwise = False
+torch._inductor.config.triton.autotune_at_compile_time = False
+
 
 # ── Parse args before anything dist-related ────────────────────────────────
 
